@@ -150,7 +150,7 @@ def cache_dir() -> str:
     return path
 
 
-def _cached_fetch(name: str, url: str, min_interval: int, timeout: float = 20.0) -> tuple[str | None, float | None]:
+def _cached_fetch(name: str, url: str, min_interval: int, timeout: float = 20.0, validate=None) -> tuple[str | None, float | None]:
     """Return (body, fetched_at).  Never hits the network more often than
     min_interval for this cache name; serves a stale copy (<= STALE_OK) when
     the network fails.  (None, None) when there is nothing usable."""
@@ -176,7 +176,7 @@ def _cached_fetch(name: str, url: str, min_interval: int, timeout: float = 20.0)
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             new = r.read().decode("utf-8", "replace")
-        ET.fromstring(new)  # must be XML, or we keep the old copy
+        (validate or ET.fromstring)(new)  # must be valid (XML by default), or we keep the old copy
         with open(path, "w", encoding="utf-8") as f:
             f.write(new)
         body, fetched_at = new, now

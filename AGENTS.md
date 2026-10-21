@@ -32,3 +32,15 @@ git clone --depth 1 https://github.com/jks-prv/kiwiclient vendor/kiwiclient
   Only use receivers whose admin allows non-browser (ext API) connections.
 - Installs go in `.venv` only. No `sudo`. No pushing — this repo has no remote.
 - Done means: tests pass + window runs + screenshot next to the design PNG + short audio clip.
+
+## FT8 decoder (`swdial/ft8/`)
+Our own pure Python + numpy decoder, written from the public protocol
+(QEX 2020). Only the LDPC(174,91) tables are protocol constants (`constants.py`).
+- `sync.py` waterfall + Costas coarse sync, 200 Hz baseband fine sync
+- `decode.py` soft bits (1/2/3-symbol), BP LDPC, CRC, signal subtraction (3 passes)
+- `ldpc.py`, `crc.py`, `unpack.py` (pack + unpack), `encode.py` (test transmitter)
+```
+.venv/bin/python -m swdial.ft8 proof/ft8-slot-7074.wav --base-hz 7074000 --start 225345 --timing
+.venv/bin/python -m swdial.ft8 proof/wessex-7074-usb.wav --auto-offset   # unaligned clip
+```
+Python API: `decode_wav(path, start_offset_s=0)`, `decode_samples(x, sr)` — sample 0 = slot boundary.

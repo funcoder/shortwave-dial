@@ -107,6 +107,25 @@ class Dial(Gtk.DrawingArea):
                 cr.move_to(cx + rl * math.cos(a) - ext.width / 2,
                            cy + rl * math.sin(a) + ext.height / 2)
                 cr.show_text(txt)
+        # voice (SSB) part of the band - blue band outside the track
+        from .voice import VOICE_SEGMENTS
+        seg = VOICE_SEGMENTS.get(self.win.band)
+        if seg:
+            f0 = max(0, (seg[0] - band["start"]) / span)
+            f1 = min(1, (seg[1] - band["start"]) / span)
+            cr.set_source_rgba(0.35, 0.62, 1.0, 0.35)
+            cr.set_line_width(6)
+            cr.arc(cx, cy, r - 3, start + sweep * f0, start + sweep * f1)
+            cr.stroke()
+        # live voice spots (DX cluster) - blue diamonds
+        cr.set_source_rgb(0.40, 0.68, 1.0)
+        for v in getattr(self.win, "voice", {}).get(self.win.band, []):
+            f = (v["hz"] - band["start"]) / span
+            if 0 <= f <= 1:
+                a = start + sweep * f
+                px, py = cx + (r - 4) * math.cos(a), cy + (r - 4) * math.sin(a)
+                cr.move_to(px, py - 7); cr.line_to(px + 6, py); cr.line_to(px, py + 7); cr.line_to(px - 6, py)
+                cr.close_path(); cr.fill()
         # spot markers (stations heard nearby)
         cr.set_source_rgb(0.24, 0.86, 0.52)
         for sp in self.win.spots.get(self.win.band, []) if hasattr(self.win, "spots") else []:
@@ -114,6 +133,15 @@ class Dial(Gtk.DrawingArea):
             if 0 <= f <= 1:
                 a = start + sweep * f
                 cr.arc(cx + (r - 22) * math.cos(a), cy + (r - 22) * math.sin(a), 3.5, 0, 2 * math.pi)
+                cr.fill()
+        # live CQ markers (decoded here) - amber triangles outside the track
+        cr.set_source_rgb(1.0, 0.45, 0.35)
+        for c in getattr(self.win, "cqs", {}).values():
+            f = (c["rf"] - band["start"]) / span
+            if 0 <= f <= 1:
+                a = start + sweep * f
+                px, py = cx + (r - 4) * math.cos(a), cy + (r - 4) * math.sin(a)
+                cr.arc(px, py, 6, 0, 2 * math.pi)
                 cr.fill()
         # inner knob
         cr.set_source_rgb(0.20, 0.195, 0.185)
@@ -189,13 +217,53 @@ class Window(Adw.ApplicationWindow):
         self.conds = {}
         self.spots = {}
         self.spot_head = Gtk.Label(label="📡 Heard nearby (click to jump)", xalign=0,
-                                   css_classes=["spot-head"], margin_top=6)
-        right.append(self.spot_head)
+                                   css_classes=["spot-head"], margin_top=4)
         self.spot_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.spot_list.connect("row-activated", self.on_spot)
         sw = Gtk.ScrolledWindow(vexpand=True, min_content_height=150)
         sw.set_child(self.spot_list)
-        right.append(sw)
+        spot_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        spot_page.append(self.spot_head)
+        spot_page.append(sw)
+
+        # live CQs decoded here by our own FT8 decoder
+        self.cqs = {}
+        self.cq_head = Gtk.Label(label="📣 Listening for CQs (USB mode, every 15 s)…", xalign=0,
+                                 css_classes=["spot-head"], margin_top=4)
+        self.cq_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.cq_list.connect("row-activated", self.on_cq)
+        sw2 = Gtk.ScrolledWindow(vexpand=True, min_content_height=150)
+        sw2.set_child(self.cq_list)
+        cq_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        cq_page.append(self.cq_head)
+        cq_page.append(sw2)
+
+        stack = Gtk.Stack(vexpand=True)
+        stack.add_titled(cq_page, "cq", "📣 Live CQs")
+        self.voice = {}
+        v_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.v_head = Gtk.Label(label="🎙️ Looking for voice stations…", xalign=0, wrap=True,
+                                css_classes=["spot-head"], margin_top=4)
+        self.v_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.v_list.connect("row-activated", self.on_voice)
+        sw4 = Gtk.ScrolledWindow(vexpand=True, min_content_height=150)
+        sw4.set_child(self.v_list)
+        v_page.append(self.v_head)
+        v_page.append(sw4)
+        stack.add_titled(v_page, "voice", "🎙️ Voice")
+        txt_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.txt_head = Gtk.Label(label="💬 FT8 messages appear here every 15 s (USB mode)", xalign=0, wrap=True)
+        self.txt_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.txt_list.connect("row-activated", self.on_cq)
+        sw3 = Gtk.ScrolledWindow(vexpand=True)
+        sw3.set_child(self.txt_list)
+        txt_page.append(self.txt_head)
+        txt_page.append(sw3)
+        stack.add_titled(txt_page, "txt", "💬 FT8 text")
+        self.txt_rows = []
+        stack.add_titled(spot_page, "spots", "📡 Heard nearby")
+        right.append(Gtk.StackSwitcher(stack=stack, margin_top=6))
+        right.append(stack)
         right.append(Gtk.Label(label="Mode", xalign=0, css_classes=["label-small"], margin_top=8))
         right.append(self._toggle_row([m.upper() for m in MODES], "mode", self.on_mode))
         body.append(right)
@@ -218,6 +286,120 @@ class Window(Adw.ApplicationWindow):
         GLib.idle_add(self.start_kiwi)
         self.refresh_conditions()
         GLib.timeout_add_seconds(300, self.refresh_conditions)  # PSKReporter fair use
+        self.refresh_voice()
+        GLib.timeout_add_seconds(120, self.refresh_voice)  # DX cluster, cached 2 min
+        from .live_ft8 import LiveFT8
+        self.live = LiveFT8(self._live_pid, self._on_ft8_slot)
+
+    # ----- live FT8 CQs -----
+    def _live_pid(self):
+        if self.proc and self.proc.poll() is None and self.mode == "usb" and not self._pending:
+            self._slot_dial = self.freq
+            return self.proc.pid
+        return None
+
+    def _on_ft8_slot(self, slot, res):  # called from a worker thread
+        GLib.idle_add(self.apply_ft8, slot, res, getattr(self, "_slot_dial", self.freq))
+
+    def apply_ft8(self, slot, res, dial):
+        now = time.time()
+        res = [r for r in res if "error" not in r]
+        ncq = 0
+        for r in res:
+            if r.get("is_cq") and r.get("call"):
+                ncq += 1
+                self.cqs[r["call"]] = {"call": r["call"], "grid": r.get("grid") or "",
+                                       "rf": int(dial + r["freq_hz"]), "snr": r.get("snr"),
+                                       "msg": r["msg"], "t": now, "slot": slot}
+        self.cqs = {k: v for k, v in self.cqs.items() if now - v["t"] < 180}
+        hh = f"{slot[:2]}:{slot[2:4]}:{slot[4:]}"
+        print(f"FT8 {slot} decodes={len(res)} cq={ncq}", flush=True)
+        self.cq_head.set_label(f"📣 {hh} UTC: {len(res)} decoded, {ncq} CQ"
+                               f" · {len(self.cqs)} CQs in last 3 min (click to jump)")
+        while (row := self.cq_list.get_row_at_index(0)) is not None:
+            self.cq_list.remove(row)
+        for c in sorted(self.cqs.values(), key=lambda c: -c["t"]):
+            snr = f"{c['snr']:+.0f} dB" if c.get("snr") is not None else ""
+            age = int(now - c["t"])
+            text = f"{c['rf'] / 1e6:.5f}  {snr:>6}  {age:>3}s ago   {c['msg']}"
+            row = Gtk.ListBoxRow()
+            row.set_child(Gtk.Label(label=text, xalign=0, css_classes=["spot-row"]))
+            row.cq = c
+            self.cq_list.append(row)
+        for k, r in enumerate(sorted(res, key=lambda r: r["freq_hz"])):
+            snr = f"{r['snr']:+.0f}" if r.get("snr") is not None else ""
+            text = f"{hh}  {snr:>4} dB  {int(r['freq_hz']):>4} Hz   {r['msg']}"
+            row = Gtk.ListBoxRow()
+            lab = Gtk.Label(label=text, xalign=0, css_classes=["spot-row"])
+            if r.get("is_cq"):
+                lab.add_css_class("cond-good")
+            row.set_child(lab)
+            row.cq = {"rf": int(dial + r["freq_hz"])}
+            self.txt_list.insert(row, k)  # this slot's block goes on top
+        self.txt_head.set_label(f"💬 {hh} UTC: {len(res)} messages (newest at top, green = CQ, click to jump)")
+        # keep the list short: last ~80 lines
+        i = 80
+        while (row := self.txt_list.get_row_at_index(i)) is not None:
+            self.txt_list.remove(row)
+        self.dial.queue_draw()
+        return False
+
+    def refresh_voice(self):
+        import threading
+
+        def work():
+            try:
+                from .voice import voice_spots
+                res = voice_spots()
+            except Exception as e:
+                res = {"error": str(e)}
+            GLib.idle_add(self.apply_voice, res)
+
+        threading.Thread(target=work, daemon=True).start()
+        return True  # keep the 2-minute timer
+
+    def apply_voice(self, res):
+        if "error" in res:
+            self.v_head.set_label(f"🔴 Voice spots unavailable: {res['error']}")
+            return False
+        self.voice = res
+        self.show_voice()
+        self.dial.queue_draw()
+        return False
+
+    def show_voice(self):
+        from .voice import VOICE_SEGMENTS
+        seg = VOICE_SEGMENTS.get(self.band)
+        while (row := self.v_list.get_row_at_index(0)) is not None:
+            self.v_list.remove(row)
+        if not seg:
+            self.v_head.set_label(f"📻 {self.band} is a broadcast band: it is all voice (AM).")
+            return
+        spots = sorted(self.voice.get(self.band, []), key=lambda v: v["hz"])
+        self.v_head.set_label(f"🎙️ {self.band} voice part is {seg[0]/1e6:.3f}–{seg[1]/1e6:.3f} MHz (blue)."
+                              f" {len(spots)} talking now (DX cluster, last 30 min, click to jump)")
+        for v in spots:
+            text = f"{v['hz']/1e6:.4f}  {v['mode'].upper()}  {v['call']:<10} {v['age_min']:>2}m ago  {v['comment'][:28]}"
+            row = Gtk.ListBoxRow()
+            row.set_child(Gtk.Label(label=text, xalign=0, css_classes=["spot-row"]))
+            row.voice = v
+            self.v_list.append(row)
+
+    def on_voice(self, _lb, row):
+        v = row.voice
+        self.mode = v["mode"]
+        self.mode_buttons[self.mode.upper()].set_active(True)
+        self.freq = clamp_to_band(self.band, v["hz"])
+        self.refresh()
+        self.queue_send()
+
+    def on_cq(self, _lb, row):
+        c = row.cq
+        self.mode = "usb"
+        self.mode_buttons["USB"].set_active(True)
+        self.freq = clamp_to_band(self.band, c["rf"] - 1500)  # heard as a 1.5 kHz tone
+        self.refresh()
+        self.queue_send()
 
     # ----- band conditions (green/amber/red) -----
     def refresh_conditions(self):
@@ -369,6 +551,7 @@ class Window(Adw.ApplicationWindow):
             self.rig.set_freq(self.freq)
             self.rig.set_mode(self.mode)
         except Exception as e:  # keep UI alive
+            print(f"SEND-ERR freq={self.freq!r} mode={self.mode!r}: {e!r}", flush=True)
             self.set_status(f"● {e}", ok=False)
         self.check_lock()
         self.write_state(True)
@@ -446,6 +629,7 @@ class Window(Adw.ApplicationWindow):
             self.freq = BANDS[name]["default"]
             self.show_cond_note()
             self.show_spots()
+            self.show_voice()
             self.refresh()
             self.queue_send()
 
@@ -478,6 +662,8 @@ class Window(Adw.ApplicationWindow):
                                      "t": time.time()}))
 
     def on_close(self, *_):
+        if getattr(self, "live", None):
+            self.live.stop()
         self.stop_kiwi()
         try:
             self.write_state(False)
