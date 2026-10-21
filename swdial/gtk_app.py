@@ -37,7 +37,7 @@ TEAL = (0.30, 0.85, 0.80)
 CSS = b"""
 window { background: #1c1b19; }
 .label-small { font-size: 15px; color: #b9b4aa; font-weight: 600; }
-.readout { font-family: monospace; font-size: 76px; font-weight: 800; color: #ffb84d; }
+.readout { font-family: monospace; font-size: 68px; font-weight: 800; color: #ffb84d; }
 .mhz { font-size: 28px; font-weight: 700; color: #f2efe8; }
 .mode-pill { font-size: 22px; font-weight: 800; color: #4fd8cc;
              border: 2px solid #4fd8cc; border-radius: 10px; padding: 2px 12px; }
@@ -136,7 +136,7 @@ class Window(Adw.ApplicationWindow):
         scroll.connect("scroll", self.on_scroll)
         self.dial.add_controller(scroll)
         left.append(self.dial)
-        hint = Gtk.Label(label="🖱  Scroll or ↑↓ ←→ to tune", css_classes=["hint"],
+        hint = Gtk.Label(label="🖱  Scroll or ↑↓ ←→ to tune  ·  ⇧ = fine 10 Hz", css_classes=["hint"],
                          halign=Gtk.Align.CENTER)
         left.append(hint)
         body.append(left)
@@ -257,7 +257,7 @@ class Window(Adw.ApplicationWindow):
 
     # ----- UI handlers -----
     def on_scroll(self, ctrl, _dx, dy):
-        step = 1000 if ctrl.get_current_event_state() & 1 else 100  # Shift
+        step = 10 if ctrl.get_current_event_state() & 1 else 100  # Shift = fine
         self.freq = clamp_to_band(self.band, int(self.freq - dy * step))
         self.refresh()
         self.queue_send()
@@ -268,7 +268,10 @@ class Window(Adw.ApplicationWindow):
         steps = {Gdk.KEY_Up: 100, Gdk.KEY_Down: -100, Gdk.KEY_Right: 1000, Gdk.KEY_Left: -1000}
         if keyval not in steps:
             return False
-        step = steps[keyval] * (10 if state & Gdk.ModifierType.SHIFT_MASK else 1)
+        if state & Gdk.ModifierType.SHIFT_MASK:  # fine tune: 10 Hz either way
+            step = 10 if steps[keyval] > 0 else -10
+        else:
+            step = steps[keyval]
         self.freq = clamp_to_band(self.band, self.freq + step)
         self.refresh()
         self.queue_send()
@@ -299,7 +302,7 @@ class Window(Adw.ApplicationWindow):
             self.status.add_css_class("off")
 
     def refresh(self):
-        self.readout.set_label(format_mhz(self.freq))
+        self.readout.set_label(f"{self.freq / 1e6:.5f}")  # 10 Hz resolution
         self.mode_pill.set_label(self.mode.upper())
         self.dial.queue_draw()
 
