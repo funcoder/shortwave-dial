@@ -426,3 +426,47 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# --------------------------------------------------------------------------
+# Individual spots (frequencies you can jump to). Reuses the same cached
+# PSKReporter file as band_conditions, so no extra queries.
+# --------------------------------------------------------------------------
+
+def parse_spots(xml_text: str, lat: float, lon: float) -> dict:
+    """-> band -> list of {call, hz, mode, km, snr, t}, one per sender (latest),
+    newest first."""
+    root = ET.fromstring(xml_text)
+    best: dict[str, dict] = {b: {} for b in BANDS}
+    for rr in root.iter("receptionReport"):
+        try:
+            hz = int(rr.get("frequency", "0"))
+            t = int(rr.get("flowStartSeconds", "0"))
+        except ValueError:
+            continue
+        call = (rr.get("senderCallsign") or "").upper()
+        if not call:
+            continue
+        for b, spec in BANDS.items():
+            if spec["start"] <= hz <= spec["end"]:
+                ll = locator_to_latlon(rr.get("senderLocator", ""))
+                km = round(distance_km(lat, lon, *ll)) if ll else None
+                prev = best[b].get(call)
+                if prev is None or t > prev["t"]:
+                    best[b][call] = {"call": call, "hz": hz, "mode": rr.get("mode", ""),
+                                     "km": km, "snr": _num(rr.get("sNR")), "t": t,
+                                     "grid": (rr.get("senderLocator") or "")[:4]}
+                break
+    return {b: sorted(v.values(), key=lambda s: -s["t"]) for b, v in best.items()}
+
+
+def heard_spots(lat: float, lon: float, *, psk_xml: str | None = None) -> dict:
+    grid = maidenhead(lat, lon)
+    if psk_xml is None:
+        psk_xml, _ = _cached_fetch(f"psk_{grid}.xml", psk_query_url(grid), PSK_MIN_INTERVAL, timeout=45)
+    if not psk_xml:
+        return {b: [] for b in BANDS}
+    try:
+        return parse_spots(psk_xml, lat, lon)
+    except ET.ParseError:
+        return {b: [] for b in BANDS}

@@ -55,6 +55,8 @@ dropdown > button { min-height: 56px; font-size: 18px; font-weight: 700; }
 .bigbtn.band.cond-fair { border-bottom: 6px solid #ffc83d; }
 .bigbtn.band.cond-poor { border-bottom: 6px solid #ff5a4e; }
 .cond-note { font-size: 15px; font-weight: 600; color: #d8d3c8; }
+.spot-row { font-family: monospace; font-size: 15px; font-weight: 700; padding: 4px 8px; }
+.spot-head { font-size: 15px; font-weight: 600; color: #b9b4aa; }
 .hint { font-size: 16px; font-weight: 600; color: #f2efe8;
         background: #262522; border-radius: 22px; padding: 6px 16px; }
 """
@@ -105,6 +107,14 @@ class Dial(Gtk.DrawingArea):
                 cr.move_to(cx + rl * math.cos(a) - ext.width / 2,
                            cy + rl * math.sin(a) + ext.height / 2)
                 cr.show_text(txt)
+        # spot markers (stations heard nearby)
+        cr.set_source_rgb(0.24, 0.86, 0.52)
+        for sp in self.win.spots.get(self.win.band, []) if hasattr(self.win, "spots") else []:
+            f = (sp["hz"] - band["start"]) / span
+            if 0 <= f <= 1:
+                a = start + sweep * f
+                cr.arc(cx + (r - 22) * math.cos(a), cy + (r - 22) * math.sin(a), 3.5, 0, 2 * math.pi)
+                cr.fill()
         # inner knob
         cr.set_source_rgb(0.20, 0.195, 0.185)
         cr.arc(cx, cy, r * 0.42, 0, 2 * math.pi)
@@ -171,11 +181,21 @@ class Window(Adw.ApplicationWindow):
 
         right.append(Gtk.Label(label="Band", xalign=0, css_classes=["label-small"], margin_top=8))
         self.band_buttons = {}
+        self.mode_buttons = {}
         right.append(self._toggle_row(list(BANDS), "band", self.on_band))
         self.cond_note = Gtk.Label(label="⏳ Checking band conditions…", xalign=0,
                                    css_classes=["cond-note"], wrap=True)
         right.append(self.cond_note)
         self.conds = {}
+        self.spots = {}
+        self.spot_head = Gtk.Label(label="📡 Heard nearby (click to jump)", xalign=0,
+                                   css_classes=["spot-head"], margin_top=6)
+        right.append(self.spot_head)
+        self.spot_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.spot_list.connect("row-activated", self.on_spot)
+        sw = Gtk.ScrolledWindow(vexpand=True, min_content_height=150)
+        sw.set_child(self.spot_list)
+        right.append(sw)
         right.append(Gtk.Label(label="Mode", xalign=0, css_classes=["label-small"], margin_top=8))
         right.append(self._toggle_row([m.upper() for m in MODES], "mode", self.on_mode))
         body.append(right)
@@ -206,8 +226,9 @@ class Window(Adw.ApplicationWindow):
 
         def work():
             try:
-                from .conditions import band_conditions
+                from .conditions import band_conditions, heard_spots
                 res = band_conditions(lat, lon)
+                res["_spots"] = heard_spots(lat, lon)
             except Exception as e:  # never break the radio over this
                 res = {"error": str(e)}
             GLib.idle_add(self.apply_conditions, res)
@@ -219,6 +240,7 @@ class Window(Adw.ApplicationWindow):
         if "error" in res:
             self.cond_note.set_label("⚪ Band conditions unavailable")
             return False
+        self.spots = res.pop("_spots", {}) or {}
         self.conds = res
         emoji = {"good": "🟢", "fair": "🟡", "poor": "🔴"}
         for band, btn in self.band_buttons.items():
@@ -229,7 +251,44 @@ class Window(Adw.ApplicationWindow):
                 btn.add_css_class("cond-" + info["rating"])
                 btn.set_tooltip_text(f"{emoji[info['rating']]} {info['rating'].upper()}: {info['reason']}")
         self.show_cond_note()
+        self.show_spots()
         return False
+
+    DIGITAL = ("FT8", "FT4", "JS8", "WSPR", "PSK31", "RTTY", "FST4", "Q65", "JT65")
+
+    def show_spots(self):
+        while (row := self.spot_list.get_row_at_index(0)) is not None:
+            self.spot_list.remove(row)
+        spots = self.spots.get(self.band, [])[:40]
+        self.spot_head.set_label(f"📡 Heard nearby on {self.band}: {len(self.spots.get(self.band, []))}"
+                                 "  (click to jump)" if spots else f"📡 Nothing heard nearby on {self.band}")
+        for sp in spots:
+            km = f"{sp['km']:,} km" if sp.get("km") is not None else ""
+            snr = f"{sp['snr']:+.0f} dB" if sp.get("snr") is not None else ""
+            text = f"{sp['hz'] / 1e6:.5f}  {sp['call']:<10} {sp.get('grid',''):<4} {km:>9}  {sp['mode']:<5} {snr}"
+            row = Gtk.ListBoxRow()
+            row.set_child(Gtk.Label(label=text, xalign=0, css_classes=["spot-row"]))
+            row.spot = sp
+            self.spot_list.append(row)
+        self.dial.queue_draw()
+
+    def on_spot(self, _lb, row):
+        sp = row.spot
+        mode = (sp.get("mode") or "").upper()
+        if mode == "CW":
+            self.mode, hz = "cw", sp["hz"]
+        elif mode in self.DIGITAL:
+            # Spot is the signal's RF frequency; tune 1500 Hz below in USB so
+            # it is heard as a ~1.5 kHz tone (how WSJT-X dials work).
+            self.mode, hz = "usb", sp["hz"] - 1500
+        else:
+            hz = sp["hz"]
+        self.freq = clamp_to_band(self.band, hz)
+        for n, b in self.mode_buttons.items():
+            if n.lower() == self.mode:
+                b.set_active(True)
+        self.refresh()
+        self.queue_send()
 
     def show_cond_note(self):
         info = self.conds.get(self.band)
@@ -251,6 +310,8 @@ class Window(Adw.ApplicationWindow):
             b.connect("toggled", handler, n)
             if kind == "band":
                 self.band_buttons[n] = b
+            else:
+                self.mode_buttons[n] = b
             box.append(b)
         return box
 
@@ -384,6 +445,7 @@ class Window(Adw.ApplicationWindow):
             self.band = name
             self.freq = BANDS[name]["default"]
             self.show_cond_note()
+            self.show_spots()
             self.refresh()
             self.queue_send()
 
