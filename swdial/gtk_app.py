@@ -1,0 +1,334 @@
+"""Shortwave Dial: GTK4 + libadwaita window that tunes a public KiwiSDR.
+
+Run:  .venv/bin/python -m swdial.gtk_app
+It starts kiwiclientd (audio -> PipeWire) with rigctl on, then sends F/M commands.
+Fair use: one channel, closes the Kiwi connection when the window closes.
+"""
+import json
+import math
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, GLib, Gtk  # noqa: E402
+
+from .bands import BANDS, MODES, clamp_to_band, format_mhz  # noqa: E402
+from .rigctl import Rigctl  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent.parent
+KIWID = ROOT / "vendor" / "kiwiclient" / "kiwiclientd.py"
+STATE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "swdial.json"
+RIG_PORT = 6400
+
+RECEIVERS = [
+    ("Wessex V2 · South West UK", "wessex.zapto.org", 8074),
+    ("Wessex V1 · South West UK", "wessex.zapto.org", 8073),
+]
+
+AMBER = (1.0, 0.72, 0.30)
+TEAL = (0.30, 0.85, 0.80)
+
+CSS = b"""
+window { background: #1c1b19; }
+.label-small { font-size: 15px; color: #b9b4aa; font-weight: 600; }
+.readout { font-family: monospace; font-size: 76px; font-weight: 800; color: #ffb84d; }
+.mhz { font-size: 28px; font-weight: 700; color: #f2efe8; }
+.mode-pill { font-size: 22px; font-weight: 800; color: #4fd8cc;
+             border: 2px solid #4fd8cc; border-radius: 10px; padding: 2px 12px; }
+.status { font-size: 14px; font-weight: 700; color: #6fdc8c; }
+.status.off { color: #ff7a6b; }
+.bigbtn { font-size: 20px; font-weight: 800; min-height: 52px; min-width: 104px; }
+.bigbtn.band:checked { background: #ffb84d; color: #1c1b19; }
+.bigbtn.mode:checked { background: #4fd8cc; color: #1c1b19; }
+dropdown > button { min-height: 56px; font-size: 18px; font-weight: 700; }
+.hint { font-size: 16px; font-weight: 600; color: #f2efe8;
+        background: #262522; border-radius: 22px; padding: 6px 16px; }
+"""
+
+
+class Dial(Gtk.DrawingArea):
+    def __init__(self, app_win):
+        super().__init__()
+        self.win = app_win
+        self.set_content_width(380)
+        self.set_content_height(380)
+        self.set_draw_func(self.draw)
+
+    def draw(self, _area, cr, w, h):
+        band = BANDS[self.win.band]
+        cx, cy, r = w / 2, h / 2, min(w, h) / 2 - 16
+        start, sweep = math.radians(135), math.radians(270)
+        # face
+        cr.set_source_rgb(0.15, 0.145, 0.135)
+        cr.arc(cx, cy, r, 0, 2 * math.pi)
+        cr.fill()
+        # track
+        cr.set_line_width(10)
+        cr.set_source_rgb(0.18, 0.30, 0.30)
+        cr.arc(cx, cy, r - 12, start, start + sweep)
+        cr.stroke()
+        frac = (self.win.freq - band["start"]) / (band["end"] - band["start"])
+        cr.set_source_rgb(*TEAL)
+        cr.arc(cx, cy, r - 12, start, start + sweep * frac)
+        cr.stroke()
+        # ticks + labels
+        span = band["end"] - band["start"]
+        cr.select_font_face("monospace", 0, 1)
+        cr.set_font_size(19)
+        for i in range(41):
+            a = start + sweep * i / 40
+            major = i % 10 == 0
+            r1, r2 = r - 30, r - (52 if major else 40)
+            cr.set_source_rgb(0.85, 0.82, 0.76)
+            cr.set_line_width(4 if major else 2)
+            cr.move_to(cx + r1 * math.cos(a), cy + r1 * math.sin(a))
+            cr.line_to(cx + r2 * math.cos(a), cy + r2 * math.sin(a))
+            cr.stroke()
+            if major:
+                txt = f"{(band['start'] + span * i / 40) / 1e6:.2f}"
+                ext = cr.text_extents(txt)
+                rl = r - 82
+                cr.move_to(cx + rl * math.cos(a) - ext.width / 2,
+                           cy + rl * math.sin(a) + ext.height / 2)
+                cr.show_text(txt)
+        # inner knob
+        cr.set_source_rgb(0.20, 0.195, 0.185)
+        cr.arc(cx, cy, r * 0.42, 0, 2 * math.pi)
+        cr.fill()
+        # needle
+        a = start + sweep * frac
+        cr.set_source_rgb(*AMBER)
+        cr.set_line_width(6)
+        cr.move_to(cx, cy)
+        cr.line_to(cx + (r - 34) * math.cos(a), cy + (r - 34) * math.sin(a))
+        cr.stroke()
+        cr.arc(cx, cy, 11, 0, 2 * math.pi)
+        cr.fill()
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Shortwave Dial")
+        self.set_default_size(1024, 700)
+        self.band, self.mode = "40m", "usb"
+        self.freq = BANDS["40m"]["default"]
+        self.proc = None
+        self.rig = None
+        self._pending = None
+        self.rx_index = 0
+
+        header = Adw.HeaderBar()
+        header.set_title_widget(Gtk.Label(label="Shortwave Dial", css_classes=["title"]))
+        tv = Adw.ToolbarView()
+        tv.add_top_bar(header)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=40,
+                       margin_top=24, margin_bottom=24, margin_start=32, margin_end=32)
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.dial = Dial(self)
+        scroll = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
+        scroll.connect("scroll", self.on_scroll)
+        self.dial.add_controller(scroll)
+        left.append(self.dial)
+        hint = Gtk.Label(label="🖱  Scroll or ↑↓ ←→ to tune", css_classes=["hint"],
+                         halign=Gtk.Align.CENTER)
+        left.append(hint)
+        body.append(left)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, hexpand=True)
+        right.append(Gtk.Label(label="Frequency", xalign=0, css_classes=["label-small"]))
+        row = Gtk.Box(spacing=12)
+        self.readout = Gtk.Label(css_classes=["readout"])
+        row.append(self.readout)
+        row.append(Gtk.Label(label="MHz", css_classes=["mhz"], valign=Gtk.Align.END, margin_bottom=16))
+        self.mode_pill = Gtk.Label(css_classes=["mode-pill"], valign=Gtk.Align.CENTER, hexpand=True,
+                                   halign=Gtk.Align.END)
+        row.append(self.mode_pill)
+        right.append(row)
+
+        right.append(Gtk.Label(label="Receiver", xalign=0, css_classes=["label-small"], margin_top=8))
+        self.rx = Gtk.DropDown.new_from_strings([r[0] for r in RECEIVERS])
+        self.rx.connect("notify::selected", self.on_receiver)
+        right.append(self.rx)
+        self.status = Gtk.Label(label="● Connecting…", xalign=0, css_classes=["status"])
+        right.append(self.status)
+
+        right.append(Gtk.Label(label="Band", xalign=0, css_classes=["label-small"], margin_top=8))
+        right.append(self._toggle_row(list(BANDS), "band", self.on_band))
+        right.append(Gtk.Label(label="Mode", xalign=0, css_classes=["label-small"], margin_top=8))
+        right.append(self._toggle_row([m.upper() for m in MODES], "mode", self.on_mode))
+        body.append(right)
+
+        tv.set_content(body)
+        self.set_content(tv)
+        self.set_size_request(560, 600)
+        # Tiled Hyprland windows can be narrow: stack dial above controls.
+        bp = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 640px"))
+        bp.add_setter(body, "orientation", Gtk.Orientation.VERTICAL)
+        bp.add_setter(body, "spacing", 16)
+        self.add_breakpoint(bp)
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)  # beat button focus nav
+        keys.connect("key-pressed", self.on_key)
+        self.add_controller(keys)
+        self.connect("close-request", self.on_close)
+        self.refresh()
+        GLib.idle_add(self.start_kiwi)
+
+    def _toggle_row(self, names, kind, handler):
+        box = Gtk.Box(spacing=10, homogeneous=True)
+        first = None
+        for n in names:
+            b = Gtk.ToggleButton(label=n, css_classes=["bigbtn", kind])
+            if first:
+                b.set_group(first)
+            else:
+                first = b
+            if n.lower() == (self.band if kind == "band" else self.mode):
+                b.set_active(True)
+            b.connect("toggled", handler, n)
+            box.append(b)
+        return box
+
+    # ----- kiwi + rigctl -----
+    def start_kiwi(self):
+        self.stop_kiwi()
+        name, host, port = RECEIVERS[self.rx_index]
+        cmd = [sys.executable, str(KIWID), "-s", host, "-p", str(port),
+               "-f", f"{self.freq / 1000:.3f}", "-m", self.mode,
+               "-u", "ShortwaveDial-G7MJF", "--rigctl", "--rigctl-port", str(RIG_PORT)]
+        log = open(ROOT / "proof" / "kiwiclientd.log", "w")
+        self.proc = subprocess.Popen(cmd, cwd=KIWID.parent, stdout=log, stderr=subprocess.STDOUT)
+        self.set_status(f"● Connecting to {name}…", ok=True)
+        self._tries = 0
+        GLib.timeout_add(500, self.try_rig)
+        return False
+
+    def try_rig(self):
+        if self.proc and self.proc.poll() is not None:
+            self.set_status("● Refused or dropped — try another receiver", ok=False)
+            return False
+        try:
+            self.rig = Rigctl(port=RIG_PORT).connect()
+            self.set_status("● Connected", ok=True)
+            self.write_state(True)
+            return False
+        except OSError:
+            self._tries += 1
+            if self._tries > 30:
+                self.set_status("● Could not reach rigctl", ok=False)
+                return False
+            return True
+
+    def stop_kiwi(self):
+        if self.rig:
+            self.rig.close()
+            self.rig = None
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.proc = None
+
+    def send(self):
+        self._pending = None
+        if not self.rig:
+            return False
+        try:
+            self.rig.set_freq(self.freq)
+            self.rig.set_mode(self.mode)
+        except Exception as e:  # keep UI alive
+            self.set_status(f"● {e}", ok=False)
+        self.write_state(True)
+        return False
+
+    def queue_send(self):
+        if self._pending:
+            GLib.source_remove(self._pending)
+        self._pending = GLib.timeout_add(120, self.send)
+
+    # ----- UI handlers -----
+    def on_scroll(self, ctrl, _dx, dy):
+        step = 1000 if ctrl.get_current_event_state() & 1 else 100  # Shift
+        self.freq = clamp_to_band(self.band, int(self.freq - dy * step))
+        self.refresh()
+        self.queue_send()
+        return True
+
+    def on_key(self, _ctrl, keyval, _code, state):
+        from gi.repository import Gdk
+        steps = {Gdk.KEY_Up: 100, Gdk.KEY_Down: -100, Gdk.KEY_Right: 1000, Gdk.KEY_Left: -1000}
+        if keyval not in steps:
+            return False
+        step = steps[keyval] * (10 if state & Gdk.ModifierType.SHIFT_MASK else 1)
+        self.freq = clamp_to_band(self.band, self.freq + step)
+        self.refresh()
+        self.queue_send()
+        return True
+
+    def on_band(self, btn, name):
+        if btn.get_active() and name != self.band:
+            self.band = name
+            self.freq = BANDS[name]["default"]
+            self.refresh()
+            self.queue_send()
+
+    def on_mode(self, btn, name):
+        if btn.get_active():
+            self.mode = name.lower()
+            self.refresh()
+            self.queue_send()
+
+    def on_receiver(self, dd, _p):
+        self.rx_index = dd.get_selected()
+        GLib.idle_add(self.start_kiwi)
+
+    def set_status(self, text, ok):
+        self.status.set_label(text)
+        if ok:
+            self.status.remove_css_class("off")
+        else:
+            self.status.add_css_class("off")
+
+    def refresh(self):
+        self.readout.set_label(format_mhz(self.freq))
+        self.mode_pill.set_label(self.mode.upper())
+        self.dial.queue_draw()
+
+    def write_state(self, on):
+        STATE.write_text(json.dumps({"freq": self.freq, "mode": self.mode, "band": self.band,
+                                     "receiver": RECEIVERS[self.rx_index][0], "on": on,
+                                     "t": time.time()}))
+
+    def on_close(self, *_):
+        self.stop_kiwi()
+        try:
+            self.write_state(False)
+        except OSError:
+            pass
+        return False
+
+
+def main():
+    Adw.init()
+    Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+    prov = Gtk.CssProvider()
+    prov.load_from_data(CSS)
+    from gi.repository import Gdk
+    Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov,
+                                              Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    app = Adw.Application(application_id="org.funcoder.ShortwaveDial")
+    app.connect("activate", lambda a: Window(a).present())
+    app.run([])
+
+
+if __name__ == "__main__":
+    main()
