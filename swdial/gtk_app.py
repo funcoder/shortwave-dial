@@ -47,8 +47,10 @@ window { background: #1c1b19; }
              border: 2px solid #4fd8cc; border-radius: 10px; padding: 2px 12px; }
 .status { font-size: 14px; font-weight: 700; color: #6fdc8c; }
 .status.off { color: #ff7a6b; }
-.bigbtn { font-size: 19px; font-weight: 800; min-height: 44px; min-width: 80px; }
-.autobtn { font-size: 17px; font-weight: 800; min-height: 44px; }
+.bigbtn { font-size: 18px; font-weight: 800; min-height: 42px; min-width: 0; padding: 0 6px; }
+.tabbtn { font-size: 15px; font-weight: 700; min-height: 34px; padding: 0 10px; }
+.tabbtn:checked { background: #4fd8cc; color: #1c1b19; }
+.autobtn { font-size: 16px; font-weight: 800; min-height: 42px; padding: 0 10px; }
 .autobtn:checked { background: #6aa8ff; color: #10141c; }
 .lookup { font-size: 17px; font-weight: 700; color: #f2efe8; background: #262522; border-radius: 10px; padding: 8px 12px; }
 entry.callbox { font-family: monospace; font-size: 20px; font-weight: 800; min-height: 44px; }
@@ -330,11 +332,32 @@ class Window(Adw.ApplicationWindow):
         log_page.append(sw6)
         stack.add_titled(log_page, "log", "📒 Log")
         self.stack = stack
-        right.append(Gtk.StackSwitcher(stack=stack, margin_top=6))
+        tabs = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
+                           max_children_per_line=6, min_children_per_line=3,
+                           column_spacing=6, row_spacing=6, margin_top=6)
+        first = None
+        page = stack.get_pages()
+        for i in range(page.get_n_items()):
+            pg = page.get_item(i)
+            b = Gtk.ToggleButton(label=pg.get_title(), css_classes=["tabbtn"])
+            if first:
+                b.set_group(first)
+            else:
+                first = b
+                b.set_active(True)
+            b.connect("toggled", lambda btn, name=pg.get_name(): btn.get_active() and stack.set_visible_child_name(name))
+            tabs.append(b)
+        right.append(tabs)
         self._grids = {}
         right.append(stack)
         rscroll = Gtk.ScrolledWindow(hexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
         rscroll.set_child(right)
+        if os.environ.get("SWDIAL_DEBUG"):
+            def _dbg():
+                mn, nat, *_ = right.measure(Gtk.Orientation.HORIZONTAL, -1)
+                print(f"LAYOUT right min={mn} nat={nat} shown={rscroll.get_width()} win={self.get_width()}", flush=True)
+                return True
+            GLib.timeout_add_seconds(3, _dbg)
         body.append(rscroll)
 
         tv.set_content(body)
