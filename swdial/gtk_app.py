@@ -67,6 +67,12 @@ levelbar.smeter block.high { background: #ffc83d; }
 levelbar.smeter block.full { background: #3ddc84; }
 levelbar.smeter block.empty { background: #33312d; }
 .meter-lbl { font-family: monospace; font-size: 16px; font-weight: 800; color: #f2efe8; }
+.compact .readout { font-size: 42px; }
+.compact .mhz { font-size: 20px; }
+.compact .bigbtn { font-size: 15px; min-height: 36px; }
+.compact .autobtn { font-size: 14px; min-height: 36px; }
+.compact .tabbtn { font-size: 13px; min-height: 30px; }
+.compact .hint { font-size: 13px; }
 .cond-note { font-size: 15px; font-weight: 600; color: #d8d3c8; }
 .spot-row { font-family: monospace; font-size: 15px; font-weight: 700; padding: 4px 8px; }
 .spot-head { font-size: 15px; font-weight: 600; color: #b9b4aa; }
@@ -79,12 +85,23 @@ class Dial(Gtk.DrawingArea):
     def __init__(self, app_win):
         super().__init__()
         self.win = app_win
-        self.set_content_width(380)
-        self.set_content_height(380)
+        self.set_content_width(220)   # smallest; grows with the window
+        self.set_content_height(220)
+        self.set_hexpand(True)
+        self.set_vexpand(True)
         self.set_draw_func(self.draw)
 
     def draw(self, _area, cr, w, h):
         self.hits = []  # (x, y, kind, item) for click-to-jump
+        sc = min(w, h) / 380
+        ox, oy = (w - 380 * sc) / 2, (h - 380 * sc) / 2
+        cr.translate(ox, oy)
+        cr.scale(sc, sc)
+        w = h = 380
+        self._draw(cr, w, h)
+        self.hits = [(ox + x * sc, oy + y * sc, k, i) for x, y, k, i in self.hits]
+
+    def _draw(self, cr, w, h):
         band = BANDS[self.win.band]
         cx, cy, r = w / 2, h / 2, min(w, h) / 2 - 16
         start, sweep = math.radians(135), math.radians(270)
@@ -209,7 +226,8 @@ class Window(Adw.ApplicationWindow):
 
         body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=40,
                        margin_top=24, margin_bottom=24, margin_start=32, margin_end=32)
-        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, hexpand=True, vexpand=True)
+        self.body, self.left = body, left
         self.dial = Dial(self)
         scroll = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
         scroll.connect("scroll", self.on_scroll)
@@ -378,11 +396,17 @@ class Window(Adw.ApplicationWindow):
 
         tv.set_content(body)
         self.set_content(tv)
-        self.set_size_request(560, 600)
+        self.set_size_request(380, 480)
         # Tiled Hyprland windows can be narrow: stack dial above controls.
-        bp = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 640px"))
+        bp = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 820px"))
+        bp.add_setter(body, "margin-start", 12)
+        bp.add_setter(body, "margin-end", 12)
+        bp.add_setter(body, "margin-top", 12)
+        bp.connect("apply", lambda *_: self.add_css_class("compact"))
+        bp.connect("unapply", lambda *_: self.remove_css_class("compact"))
         bp.add_setter(body, "orientation", Gtk.Orientation.VERTICAL)
         bp.add_setter(body, "spacing", 16)
+        bp.add_setter(left, "vexpand", False)
         self.add_breakpoint(bp)
         keys = Gtk.EventControllerKey()
         keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)  # beat button focus nav
