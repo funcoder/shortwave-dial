@@ -26,9 +26,9 @@ KIWID = ROOT / "vendor" / "kiwiclient" / "kiwiclientd.py"
 STATE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "swdial.json"
 RIG_PORT = 6400
 
-RECEIVERS = [
-    ("Wessex V2 · South West UK", "wessex.zapto.org", 8074),
-    ("Wessex V1 · South West UK", "wessex.zapto.org", 8073),
+RECEIVERS = [  # name, host, port, lat, lon
+    ("Wessex V2 · South West UK", "wessex.zapto.org", 8074, 50.74, -2.64),
+    ("Wessex V1 · South West UK", "wessex.zapto.org", 8073, 50.74, -2.64),
 ]
 
 AMBER = (1.0, 0.72, 0.30)
@@ -38,6 +38,10 @@ CSS = b"""
 window { background: #1c1b19; }
 .label-small { font-size: 15px; color: #b9b4aa; font-weight: 600; }
 .readout { font-family: monospace; font-size: 68px; font-weight: 800; color: #ffb84d; }
+.readout.pending { color: #8a6a3a; }
+.lock { font-size: 16px; font-weight: 800; color: #6fdc8c; }
+.lock.pending { color: #ffc83d; }
+.lock.off { color: #ff7a6b; }
 .mhz { font-size: 28px; font-weight: 700; color: #f2efe8; }
 .mode-pill { font-size: 22px; font-weight: 800; color: #4fd8cc;
              border: 2px solid #4fd8cc; border-radius: 10px; padding: 2px 12px; }
@@ -47,6 +51,10 @@ window { background: #1c1b19; }
 .bigbtn.band:checked { background: #ffb84d; color: #1c1b19; }
 .bigbtn.mode:checked { background: #4fd8cc; color: #1c1b19; }
 dropdown > button { min-height: 56px; font-size: 18px; font-weight: 700; }
+.bigbtn.band.cond-good { border-bottom: 6px solid #3ddc84; }
+.bigbtn.band.cond-fair { border-bottom: 6px solid #ffc83d; }
+.bigbtn.band.cond-poor { border-bottom: 6px solid #ff5a4e; }
+.cond-note { font-size: 15px; font-weight: 600; color: #d8d3c8; }
 .hint { font-size: 16px; font-weight: 600; color: #f2efe8;
         background: #262522; border-radius: 22px; padding: 6px 16px; }
 """
@@ -151,6 +159,8 @@ class Window(Adw.ApplicationWindow):
                                    halign=Gtk.Align.END)
         row.append(self.mode_pill)
         right.append(row)
+        self.lock = Gtk.Label(label="⏳ Waiting for receiver…", xalign=0, css_classes=["lock", "pending"])
+        right.append(self.lock)
 
         right.append(Gtk.Label(label="Receiver", xalign=0, css_classes=["label-small"], margin_top=8))
         self.rx = Gtk.DropDown.new_from_strings([r[0] for r in RECEIVERS])
@@ -160,7 +170,12 @@ class Window(Adw.ApplicationWindow):
         right.append(self.status)
 
         right.append(Gtk.Label(label="Band", xalign=0, css_classes=["label-small"], margin_top=8))
+        self.band_buttons = {}
         right.append(self._toggle_row(list(BANDS), "band", self.on_band))
+        self.cond_note = Gtk.Label(label="⏳ Checking band conditions…", xalign=0,
+                                   css_classes=["cond-note"], wrap=True)
+        right.append(self.cond_note)
+        self.conds = {}
         right.append(Gtk.Label(label="Mode", xalign=0, css_classes=["label-small"], margin_top=8))
         right.append(self._toggle_row([m.upper() for m in MODES], "mode", self.on_mode))
         body.append(right)
@@ -180,6 +195,46 @@ class Window(Adw.ApplicationWindow):
         self.connect("close-request", self.on_close)
         self.refresh()
         GLib.idle_add(self.start_kiwi)
+        self.refresh_conditions()
+        GLib.timeout_add_seconds(300, self.refresh_conditions)  # PSKReporter fair use
+
+    # ----- band conditions (green/amber/red) -----
+    def refresh_conditions(self):
+        import threading
+        _n, _h, _p, lat, lon = RECEIVERS[self.rx_index]
+
+        def work():
+            try:
+                from .conditions import band_conditions
+                res = band_conditions(lat, lon)
+            except Exception as e:  # never break the radio over this
+                res = {"error": str(e)}
+            GLib.idle_add(self.apply_conditions, res)
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def apply_conditions(self, res):
+        if "error" in res:
+            self.cond_note.set_label("⚪ Band conditions unavailable")
+            return False
+        self.conds = res
+        emoji = {"good": "🟢", "fair": "🟡", "poor": "🔴"}
+        for band, btn in self.band_buttons.items():
+            for c in ("cond-good", "cond-fair", "cond-poor"):
+                btn.remove_css_class(c)
+            info = res.get(band)
+            if info and info.get("rating") in emoji:
+                btn.add_css_class("cond-" + info["rating"])
+                btn.set_tooltip_text(f"{emoji[info['rating']]} {info['rating'].upper()}: {info['reason']}")
+        self.show_cond_note()
+        return False
+
+    def show_cond_note(self):
+        info = self.conds.get(self.band)
+        if info:
+            e = {"good": "🟢", "fair": "🟡", "poor": "🔴"}.get(info["rating"], "⚪")
+            self.cond_note.set_label(f"{e} {self.band} {info['rating'].upper()} · {info['reason']}")
 
     def _toggle_row(self, names, kind, handler):
         box = Gtk.Box(spacing=10, homogeneous=True)
@@ -193,19 +248,22 @@ class Window(Adw.ApplicationWindow):
             if n.lower() == (self.band if kind == "band" else self.mode):
                 b.set_active(True)
             b.connect("toggled", handler, n)
+            if kind == "band":
+                self.band_buttons[n] = b
             box.append(b)
         return box
 
     # ----- kiwi + rigctl -----
     def start_kiwi(self):
         self.stop_kiwi()
-        name, host, port = RECEIVERS[self.rx_index]
+        name, host, port, _lat, _lon = RECEIVERS[self.rx_index]
         cmd = [sys.executable, str(KIWID), "-s", host, "-p", str(port),
                "-f", f"{self.freq / 1000:.3f}", "-m", self.mode,
                "-u", "ShortwaveDial-G7MJF", "--rigctl", "--rigctl-port", str(RIG_PORT)]
         log = open(ROOT / "proof" / "kiwiclientd.log", "w")
         self.proc = subprocess.Popen(cmd, cwd=KIWID.parent, stdout=log, stderr=subprocess.STDOUT)
         self.set_status(f"● Connecting to {name}…", ok=True)
+        self.set_lock("⏳ Waiting for receiver…", "pending")
         self._tries = 0
         GLib.timeout_add(500, self.try_rig)
         return False
@@ -217,6 +275,9 @@ class Window(Adw.ApplicationWindow):
         try:
             self.rig = Rigctl(port=RIG_PORT).connect()
             self.set_status("● Connected", ok=True)
+            self.check_lock()
+            if not getattr(self, "_lock_timer", None):
+                self._lock_timer = GLib.timeout_add_seconds(2, self.check_lock)
             self.write_state(True)
             return False
         except OSError:
@@ -247,12 +308,41 @@ class Window(Adw.ApplicationWindow):
             self.rig.set_mode(self.mode)
         except Exception as e:  # keep UI alive
             self.set_status(f"● {e}", ok=False)
+        self.check_lock()
         self.write_state(True)
         return False
+
+    def check_lock(self):
+        """Read the frequency back from the receiver link and compare."""
+        if not self.rig or self._pending:
+            return True
+        try:
+            rx_hz = self.rig.get_freq()
+            rx_mode = self.rig.get_mode().lower()
+        except Exception:
+            self.set_lock("⚠️ No answer from receiver", "off")
+            return True
+        if abs(rx_hz - self.freq) <= 5 and rx_mode == self.mode:
+            self.set_lock(f"✅ Receiver locked on {rx_hz / 1e6:.5f} MHz {rx_mode.upper()}", None)
+        else:
+            self.set_lock(f"⚠️ Receiver is on {rx_hz / 1e6:.5f} MHz {rx_mode.upper()}", "off")
+        return True
+
+    def set_lock(self, text, state):
+        self.lock.set_label(text)
+        for c in ("pending", "off"):
+            self.lock.remove_css_class(c)
+        if state:
+            self.lock.add_css_class(state)
+        if state == "pending":
+            self.readout.add_css_class("pending")
+        else:
+            self.readout.remove_css_class("pending")
 
     def queue_send(self):
         if self._pending:
             GLib.source_remove(self._pending)
+        self.set_lock("🟡 Tuning…", "pending")
         self._pending = GLib.timeout_add(120, self.send)
 
     # ----- UI handlers -----
@@ -281,6 +371,7 @@ class Window(Adw.ApplicationWindow):
         if btn.get_active() and name != self.band:
             self.band = name
             self.freq = BANDS[name]["default"]
+            self.show_cond_note()
             self.refresh()
             self.queue_send()
 
@@ -293,6 +384,7 @@ class Window(Adw.ApplicationWindow):
     def on_receiver(self, dd, _p):
         self.rx_index = dd.get_selected()
         GLib.idle_add(self.start_kiwi)
+        self.refresh_conditions()
 
     def set_status(self, text, ok):
         self.status.set_label(text)
@@ -308,7 +400,7 @@ class Window(Adw.ApplicationWindow):
 
     def write_state(self, on):
         STATE.write_text(json.dumps({"freq": self.freq, "mode": self.mode, "band": self.band,
-                                     "receiver": RECEIVERS[self.rx_index][0], "on": on,
+                                     "receiver": RECEIVERS[self.rx_index][0], "conditions": {b: v.get("rating") for b, v in self.conds.items() if isinstance(v, dict)}, "on": on,
                                      "t": time.time()}))
 
     def on_close(self, *_):
