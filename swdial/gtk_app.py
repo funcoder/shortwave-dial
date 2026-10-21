@@ -61,6 +61,12 @@ dropdown.rxdrop > button { min-height: 34px; font-size: 15px; }
 .bigbtn.band.cond-good { border-bottom: 6px solid #3ddc84; }
 .bigbtn.band.cond-fair { border-bottom: 6px solid #ffc83d; }
 .bigbtn.band.cond-poor { border-bottom: 6px solid #ff5a4e; }
+levelbar.smeter block { min-height: 14px; border-radius: 7px; }
+levelbar.smeter block.low { background: #ff7a6b; }
+levelbar.smeter block.high { background: #ffc83d; }
+levelbar.smeter block.full { background: #3ddc84; }
+levelbar.smeter block.empty { background: #33312d; }
+.meter-lbl { font-family: monospace; font-size: 16px; font-weight: 800; color: #f2efe8; }
 .cond-note { font-size: 15px; font-weight: 600; color: #d8d3c8; }
 .spot-row { font-family: monospace; font-size: 15px; font-weight: 700; padding: 4px 8px; }
 .spot-head { font-size: 15px; font-weight: 600; color: #b9b4aa; }
@@ -243,6 +249,16 @@ class Window(Adw.ApplicationWindow):
         right.append(mrow)
         self.lock = Gtk.Label(label="⏳ Waiting for receiver…", xalign=0, css_classes=["lock", "pending"])
         right.append(self.lock)
+        mrow2 = Gtk.Box(spacing=10)
+        self.meter = Gtk.LevelBar(min_value=0, max_value=15, hexpand=True, valign=Gtk.Align.CENTER,
+                                  css_classes=["smeter"])
+        for name, val in (("low", 5), ("high", 9), ("full", 15)):
+            self.meter.add_offset_value(name, val)
+        mrow2.append(self.meter)
+        self.meter_lbl = Gtk.Label(label="📶 S-meter starting…", xalign=0, css_classes=["meter-lbl"])
+        mrow2.append(self.meter_lbl)
+        right.append(mrow2)
+        GLib.timeout_add(500, self.update_meter)
 
         self.status = Gtk.Label(label="● Connecting…", xalign=0, css_classes=["status"])
         right.append(self.status)
@@ -614,9 +630,11 @@ class Window(Adw.ApplicationWindow):
             self.lookup_out.set_label("✍️ Type a callsign first.")
             return
         from .lookup import log_entry
-        log_entry(call, self.freq, self.band, self.mode, grid=self._grids.get(call, ""),
+        rst = self.report()
+        log_entry(call, self.freq, self.band, self.mode, grid=self._grids.get(call, ""), rst=rst,
                   note="FT8" if self.mode == "usb" and call in self.cqs else "")
-        self.lookup_out.set_label(f"✅ Logged {call} on {self.freq / 1e6:.4f} MHz {self.mode.upper()}")
+        self.lookup_out.set_label(f"✅ Logged {call} on {self.freq / 1e6:.4f} MHz {self.mode.upper()}"
+                                  + (f"  ·  report {rst}" if rst else ""))
         self.show_log()
 
     def show_log(self):
@@ -626,7 +644,7 @@ class Window(Adw.ApplicationWindow):
         for d in read_log():
             t = d.get("TIME_ON", "")[:4]
             text = (f"{d.get('QSO_DATE', '')[6:8]}/{d.get('QSO_DATE', '')[4:6]} {t[:2]}:{t[2:]}Z  "
-                    f"{d['CALL']:<10} {d.get('FREQ', '')[:7]:<8} {d.get('MODE', ''):<4} {d.get('GRIDSQUARE', '')}")
+                    f"{d['CALL']:<10} {d.get('FREQ', '')[:7]:<8} {d.get('MODE', ''):<4} {d.get('RST_RCVD', ''):>4}  {d.get('GRIDSQUARE', '')}")
             row = Gtk.ListBoxRow()
             row.set_child(Gtk.Label(label=text, xalign=0, css_classes=["spot-row"]))
             self.log_list.append(row)
@@ -743,13 +761,66 @@ class Window(Adw.ApplicationWindow):
         cmd = [sys.executable, str(KIWID), "-s", host, "-p", str(port),
                "-f", f"{self.freq / 1000:.3f}", "-m", self.mode,
                "-u", "ShortwaveDial-G7MJF", "--rigctl", "--rigctl-port", str(RIG_PORT)]
-        log = open(ROOT / "proof" / "kiwiclientd.log", "w")
-        self.proc = subprocess.Popen(cmd, cwd=KIWID.parent, stdout=log, stderr=subprocess.STDOUT)
+        self.proc = subprocess.Popen(cmd, cwd=KIWID.parent, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        import threading
+        threading.Thread(target=self._read_kiwi, args=(self.proc,), daemon=True).start()
         self.set_status(f"● Connecting to {name}…", ok=True)
         self.set_lock("⏳ Waiting for receiver…", "pending")
         self._tries = 0
         GLib.timeout_add(500, self.try_rig)
         return False
+
+    def _read_kiwi(self, proc):
+        """kiwiclientd prints 'Block: …, RSSI: -97.7, …' per audio block. Keep a
+        smoothed S-meter and write only the other lines to the log."""
+        import re
+        pat = re.compile(rb"RSSI:\s*(-?[0-9.]+)")
+        with open(ROOT / "proof" / "kiwiclientd.log", "wb") as log:
+            buf = b""
+            while True:
+                chunk = proc.stdout.read1(4096) if hasattr(proc.stdout, "read1") else proc.stdout.read(512)
+                if not chunk:
+                    break
+                buf += chunk
+                *parts, buf = re.split(rb"[\r\n]", buf)
+                for line in parts:
+                    m = pat.search(line)
+                    if m:
+                        v = float(m.group(1))
+                        old = getattr(self, "_rssi", None)
+                        # fast attack, slow release, like a real S-meter
+                        self._rssi = v if old is None or v > old else old * 0.85 + v * 0.15
+                        if old is None:
+                            print(f"RSSI first {v}", flush=True)
+                    elif line.strip():
+                        log.write(line + b"\n")
+                        log.flush()
+
+    @staticmethod
+    def s_units(dbm):
+        """HF S-meter: S9 = -73 dBm, 6 dB per S unit."""
+        if dbm >= -73:
+            over = int(round(dbm + 73))
+            return 9, over
+        return max(0, min(9, int(round(9 + (dbm + 73) / 6)))), 0
+
+    def report(self):
+        """Signal report for the log: RS for voice/AM (e.g. 57), RST for CW (579)."""
+        if getattr(self, "_rssi", None) is None:
+            return ""
+        s, _ = self.s_units(self._rssi)
+        s = max(1, s)
+        return f"5{s}9" if self.mode == "cw" else f"5{s}"
+
+    def update_meter(self):
+        v = getattr(self, "_rssi", None)
+        if v is None or self._pending or getattr(self, "_held", False):
+            return True
+        s, over = self.s_units(v)
+        self.meter.set_value(min(15.0, s + over / 6))
+        txt = f"S9+{over}" if over else f"S{s}"
+        self.meter_lbl.set_label(f"📶 {txt}  ({v:.0f} dBm)  ·  report {self.report()}")
+        return True
 
     def try_rig(self):
         if self.proc and self.proc.poll() is not None:

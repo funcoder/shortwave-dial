@@ -105,7 +105,7 @@ def _f(tag, val):
     return f"<{tag}:{len(val)}>{val} " if val else ""
 
 
-def log_entry(call, hz, band, mode, grid="", snr=None, note="", path_=LOG, when=None) -> str:
+def log_entry(call, hz, band, mode, grid="", snr=None, note="", path_=LOG, when=None, rst="") -> str:
     """Append one SWL record (heard, not a two-way contact) to the ADIF log."""
     when = when or datetime.now(timezone.utc)
     path_.parent.mkdir(parents=True, exist_ok=True)
@@ -115,7 +115,7 @@ def log_entry(call, hz, band, mode, grid="", snr=None, note="", path_=LOG, when=
         m = "FT8"
     rec = (_f("CALL", call.upper()) + _f("QSO_DATE", when.strftime("%Y%m%d")) + _f("TIME_ON", when.strftime("%H%M%S"))
            + _f("FREQ", f"{hz / 1e6:.6f}") + _f("BAND", band.upper() if band.endswith("m") else band) + _f("MODE", m)
-           + _f("GRIDSQUARE", grid) + _f("RST_RCVD", "" if snr is None else f"{snr:+.0f}")
+           + _f("GRIDSQUARE", grid) + _f("RST_RCVD", rst or ("" if snr is None else f"{snr:+.0f}"))
            + _f("COMMENT", ("SWL " + note).strip()) + "<EOR>\n")
     with open(path_, "a", encoding="utf-8") as f:
         if new:
