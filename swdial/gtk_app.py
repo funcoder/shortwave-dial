@@ -37,7 +37,7 @@ TEAL = (0.30, 0.85, 0.80)
 CSS = b"""
 window { background: #1c1b19; }
 .label-small { font-size: 15px; color: #b9b4aa; font-weight: 600; }
-.readout { font-family: monospace; font-size: 68px; font-weight: 800; color: #ffb84d; }
+.readout { font-family: monospace; font-size: 58px; font-weight: 800; color: #ffb84d; }
 .readout.pending { color: #8a6a3a; }
 .lock { font-size: 16px; font-weight: 800; color: #6fdc8c; }
 .lock.pending { color: #ffc83d; }
@@ -47,10 +47,15 @@ window { background: #1c1b19; }
              border: 2px solid #4fd8cc; border-radius: 10px; padding: 2px 12px; }
 .status { font-size: 14px; font-weight: 700; color: #6fdc8c; }
 .status.off { color: #ff7a6b; }
-.bigbtn { font-size: 20px; font-weight: 800; min-height: 52px; min-width: 104px; }
+.bigbtn { font-size: 19px; font-weight: 800; min-height: 44px; min-width: 80px; }
+.autobtn { font-size: 17px; font-weight: 800; min-height: 44px; }
+.autobtn:checked { background: #6aa8ff; color: #10141c; }
+.lookup { font-size: 17px; font-weight: 700; color: #f2efe8; background: #262522; border-radius: 10px; padding: 8px 12px; }
+entry.callbox { font-family: monospace; font-size: 20px; font-weight: 800; min-height: 44px; }
+dropdown.rxdrop > button { min-height: 34px; font-size: 15px; }
 .bigbtn.band:checked { background: #ffb84d; color: #1c1b19; }
 .bigbtn.mode:checked { background: #4fd8cc; color: #1c1b19; }
-dropdown > button { min-height: 56px; font-size: 18px; font-weight: 700; }
+
 .bigbtn.band.cond-good { border-bottom: 6px solid #3ddc84; }
 .bigbtn.band.cond-fair { border-bottom: 6px solid #ffc83d; }
 .bigbtn.band.cond-poor { border-bottom: 6px solid #ff5a4e; }
@@ -71,6 +76,7 @@ class Dial(Gtk.DrawingArea):
         self.set_draw_func(self.draw)
 
     def draw(self, _area, cr, w, h):
+        self.hits = []  # (x, y, kind, item) for click-to-jump
         band = BANDS[self.win.band]
         cx, cy, r = w / 2, h / 2, min(w, h) / 2 - 16
         start, sweep = math.radians(135), math.radians(270)
@@ -126,14 +132,28 @@ class Dial(Gtk.DrawingArea):
                 px, py = cx + (r - 4) * math.cos(a), cy + (r - 4) * math.sin(a)
                 cr.move_to(px, py - 7); cr.line_to(px + 6, py); cr.line_to(px, py + 7); cr.line_to(px - 6, py)
                 cr.close_path(); cr.fill()
+                self.hits.append((px, py, "voice", v))
+        # broadcast stations on air now - white ticks
+        cr.set_source_rgb(0.95, 0.93, 0.88)
+        cr.set_line_width(2)
+        for b in getattr(self.win, "bc", []):
+            f = (b["hz"] - band["start"]) / span
+            if 0 <= f <= 1:
+                a = start + sweep * f
+                cr.move_to(cx + (r - 1) * math.cos(a), cy + (r - 1) * math.sin(a))
+                cr.line_to(cx + (r - 9) * math.cos(a), cy + (r - 9) * math.sin(a))
+                cr.stroke()
+                self.hits.append((cx + (r - 5) * math.cos(a), cy + (r - 5) * math.sin(a), "station", b))
         # spot markers (stations heard nearby)
         cr.set_source_rgb(0.24, 0.86, 0.52)
         for sp in self.win.spots.get(self.win.band, []) if hasattr(self.win, "spots") else []:
             f = (sp["hz"] - band["start"]) / span
             if 0 <= f <= 1:
                 a = start + sweep * f
-                cr.arc(cx + (r - 22) * math.cos(a), cy + (r - 22) * math.sin(a), 3.5, 0, 2 * math.pi)
+                px, py = cx + (r - 22) * math.cos(a), cy + (r - 22) * math.sin(a)
+                cr.arc(px, py, 3.5, 0, 2 * math.pi)
                 cr.fill()
+                self.hits.append((px, py, "spot", sp))
         # live CQ markers (decoded here) - amber triangles outside the track
         cr.set_source_rgb(1.0, 0.45, 0.35)
         for c in getattr(self.win, "cqs", {}).values():
@@ -143,6 +163,7 @@ class Dial(Gtk.DrawingArea):
                 px, py = cx + (r - 4) * math.cos(a), cy + (r - 4) * math.sin(a)
                 cr.arc(px, py, 6, 0, 2 * math.pi)
                 cr.fill()
+                self.hits.append((px, py, "cq", c))
         # inner knob
         cr.set_source_rgb(0.20, 0.195, 0.185)
         cr.arc(cx, cy, r * 0.42, 0, 2 * math.pi)
@@ -173,6 +194,10 @@ class Window(Adw.ApplicationWindow):
         header.set_title_widget(Gtk.Label(label="Shortwave Dial", css_classes=["title"]))
         tv = Adw.ToolbarView()
         tv.add_top_bar(header)
+        self.rx = Gtk.DropDown.new_from_strings([r[0] for r in RECEIVERS])
+        self.rx.add_css_class("rxdrop")
+        self.rx.connect("notify::selected", self.on_receiver)
+        header.pack_start(self.rx)
 
         body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=40,
                        margin_top=24, margin_bottom=24, margin_start=32, margin_end=32)
@@ -181,6 +206,9 @@ class Window(Adw.ApplicationWindow):
         scroll = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
         scroll.connect("scroll", self.on_scroll)
         self.dial.add_controller(scroll)
+        click = Gtk.GestureClick()
+        click.connect("pressed", self.on_dial_click)
+        self.dial.add_controller(click)
         left.append(self.dial)
         hint = Gtk.Label(label="🖱  Scroll or ↑↓ ←→ to tune  ·  ⇧ = fine 10 Hz", css_classes=["hint"],
                          halign=Gtk.Align.CENTER)
@@ -197,19 +225,27 @@ class Window(Adw.ApplicationWindow):
                                    halign=Gtk.Align.END)
         row.append(self.mode_pill)
         right.append(row)
+        self.auto = True
+        self._guard = False
+        self._skip_auto = False
+        self.band_buttons = {}
+        self.mode_buttons = {}
+        mrow = Gtk.Box(spacing=10)
+        modes = self._toggle_row([m.upper() for m in MODES], "mode", self.on_mode)
+        modes.set_hexpand(True)
+        mrow.append(modes)
+        self.auto_btn = Gtk.ToggleButton(label="✨ Auto", active=True, css_classes=["autobtn"],
+                                         tooltip_text="Pick CW / USB / LSB / AM for the part of the band you are in")
+        self.auto_btn.connect("toggled", self.on_auto)
+        mrow.append(self.auto_btn)
+        right.append(mrow)
         self.lock = Gtk.Label(label="⏳ Waiting for receiver…", xalign=0, css_classes=["lock", "pending"])
         right.append(self.lock)
 
-        right.append(Gtk.Label(label="Receiver", xalign=0, css_classes=["label-small"], margin_top=8))
-        self.rx = Gtk.DropDown.new_from_strings([r[0] for r in RECEIVERS])
-        self.rx.connect("notify::selected", self.on_receiver)
-        right.append(self.rx)
         self.status = Gtk.Label(label="● Connecting…", xalign=0, css_classes=["status"])
         right.append(self.status)
 
         right.append(Gtk.Label(label="Band", xalign=0, css_classes=["label-small"], margin_top=8))
-        self.band_buttons = {}
-        self.mode_buttons = {}
         right.append(self._toggle_row(list(BANDS), "band", self.on_band))
         self.cond_note = Gtk.Label(label="⏳ Checking band conditions…", xalign=0,
                                    css_classes=["cond-note"], wrap=True)
@@ -239,6 +275,17 @@ class Window(Adw.ApplicationWindow):
         cq_page.append(sw2)
 
         stack = Gtk.Stack(vexpand=True)
+        self.bc = []
+        bc_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.bc_head = Gtk.Label(label="📻 Loading station list…", xalign=0, wrap=True,
+                                 css_classes=["spot-head"], margin_top=4)
+        self.bc_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.bc_list.connect("row-activated", self.on_station)
+        sw5 = Gtk.ScrolledWindow(vexpand=True, min_content_height=150)
+        sw5.set_child(self.bc_list)
+        bc_page.append(self.bc_head)
+        bc_page.append(sw5)
+        stack.add_titled(bc_page, "bc", "📻 Stations")
         stack.add_titled(cq_page, "cq", "📣 Live CQs")
         self.voice = {}
         v_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -261,12 +308,34 @@ class Window(Adw.ApplicationWindow):
         txt_page.append(sw3)
         stack.add_titled(txt_page, "txt", "💬 FT8 text")
         self.txt_rows = []
-        stack.add_titled(spot_page, "spots", "📡 Heard nearby")
+        stack.add_titled(spot_page, "spots", "📡 Heard")
+        log_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=6)
+        lrow = Gtk.Box(spacing=8)
+        self.call_entry = Gtk.Entry(placeholder_text="Callsign", hexpand=True, css_classes=["callbox"])
+        self.call_entry.connect("activate", self.on_lookup)
+        lrow.append(self.call_entry)
+        b1 = Gtk.Button(label="🔎 Look up", css_classes=["bigbtn"])
+        b1.connect("clicked", self.on_lookup)
+        lrow.append(b1)
+        b2 = Gtk.Button(label="📝 Log it", css_classes=["bigbtn"])
+        b2.connect("clicked", self.on_log)
+        lrow.append(b2)
+        log_page.append(lrow)
+        self.lookup_out = Gtk.Label(label="Type a call, or click a station anywhere to fill it in.",
+                                    xalign=0, wrap=True, css_classes=["lookup"])
+        log_page.append(self.lookup_out)
+        self.log_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        sw6 = Gtk.ScrolledWindow(vexpand=True, min_content_height=120)
+        sw6.set_child(self.log_list)
+        log_page.append(sw6)
+        stack.add_titled(log_page, "log", "📒 Log")
+        self.stack = stack
         right.append(Gtk.StackSwitcher(stack=stack, margin_top=6))
+        self._grids = {}
         right.append(stack)
-        right.append(Gtk.Label(label="Mode", xalign=0, css_classes=["label-small"], margin_top=8))
-        right.append(self._toggle_row([m.upper() for m in MODES], "mode", self.on_mode))
-        body.append(right)
+        rscroll = Gtk.ScrolledWindow(hexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        rscroll.set_child(right)
+        body.append(rscroll)
 
         tv.set_content(body)
         self.set_content(tv)
@@ -288,6 +357,9 @@ class Window(Adw.ApplicationWindow):
         GLib.timeout_add_seconds(300, self.refresh_conditions)  # PSKReporter fair use
         self.refresh_voice()
         GLib.timeout_add_seconds(120, self.refresh_voice)  # DX cluster, cached 2 min
+        self.refresh_stations()
+        GLib.timeout_add_seconds(600, self.refresh_stations)  # EiBi, downloaded once a day
+        self.show_log()
         from .live_ft8 import LiveFT8
         self.live = LiveFT8(self._live_pid, self._on_ft8_slot)
 
@@ -308,6 +380,8 @@ class Window(Adw.ApplicationWindow):
         for r in res:
             if r.get("is_cq") and r.get("call"):
                 ncq += 1
+                if r.get("grid"):
+                    self._grids[r["call"]] = r["grid"]
                 self.cqs[r["call"]] = {"call": r["call"], "grid": r.get("grid") or "",
                                        "rf": int(dial + r["freq_hz"]), "snr": r.get("snr"),
                                        "msg": r["msg"], "t": now, "slot": slot}
@@ -387,16 +461,158 @@ class Window(Adw.ApplicationWindow):
 
     def on_voice(self, _lb, row):
         v = row.voice
-        self.mode = v["mode"]
-        self.mode_buttons[self.mode.upper()].set_active(True)
+        self.set_mode_ui(v["mode"])
+        self._skip_auto = True
+        self.fill_call(v["call"])
         self.freq = clamp_to_band(self.band, v["hz"])
         self.refresh()
         self.queue_send()
 
+    # ----- auto mode -----
+    def auto_mode(self, hz):
+        if self.band == "40m":
+            if hz < 7_040_000:
+                return "cw"
+            if hz < 7_060_000 or 7_070_000 <= hz <= 7_080_000:  # digital: FT8 7.074, JS8 7.078
+                return "usb"
+            return "lsb"
+        if self.band == "20m":
+            return "cw" if hz < 14_070_000 else "usb"
+        return "am"  # broadcast bands
+
+    def set_mode_ui(self, mode):
+        self._guard = True
+        try:
+            self.mode = mode
+            b = self.mode_buttons.get(mode.upper())
+            if b:
+                b.set_active(True)
+            self.refresh()
+        finally:
+            self._guard = False
+
+    def on_auto(self, btn):
+        self.auto = btn.get_active()
+        if self.auto:
+            self.queue_send()
+
+    # ----- click a marker on the dial -----
+    def on_dial_click(self, _g, _n, x, y):
+        best, bd = None, 15 ** 2
+        for px, py, kind, item in getattr(self.dial, "hits", []):
+            d = (px - x) ** 2 + (py - y) ** 2
+            if d < bd:
+                best, bd = (kind, item), d
+        if not best:
+            return
+        from types import SimpleNamespace as NS
+        kind, item = best
+        {"spot": lambda: self.on_spot(None, NS(spot=item)),
+         "cq": lambda: self.on_cq(None, NS(cq=item)),
+         "voice": lambda: self.on_voice(None, NS(voice=item)),
+         "station": lambda: self.on_station(None, NS(station=item))}[kind]()
+
+    # ----- broadcast stations (EiBi) -----
+    def refresh_stations(self):
+        import threading
+
+        def work():
+            try:
+                from .stations import stations_now
+                res = {b: stations_now(v["start"], v["end"]) for b, v in BANDS.items() if v["mode"] == "am"}
+            except Exception as e:
+                res = {"error": str(e)}
+            GLib.idle_add(self.apply_stations, res)
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def apply_stations(self, res):
+        if "error" in res:
+            self.bc_head.set_label(f"🔴 Station list unavailable: {res['error']}")
+            return False
+        self._bc_all = res
+        self.show_stations()
+        return False
+
+    def show_stations(self):
+        all_ = getattr(self, "_bc_all", None)
+        while (row := self.bc_list.get_row_at_index(0)) is not None:
+            self.bc_list.remove(row)
+        if all_ is None:
+            return
+        self.bc = all_.get(self.band, [])
+        if BANDS[self.band]["mode"] != "am":
+            self.bc_head.set_label("📻 Broadcast stations are on 31m and 25m. Pick one of those bands.")
+        else:
+            self.bc_head.set_label(f"📻 {len(self.bc)} stations on {self.band} right now (EiBi schedule, click to jump)")
+        for b in self.bc:
+            text = f"{b['hz'] / 1e3:>6.0f} kHz  {b['station'][:26]:<26} {b['lang'][:10]:<10} → {b['target']}"
+            row = Gtk.ListBoxRow()
+            row.set_child(Gtk.Label(label=text, xalign=0, css_classes=["spot-row"]))
+            row.station = b
+            self.bc_list.append(row)
+        self.dial.queue_draw()
+
+    def on_station(self, _lb, row):
+        b = row.station
+        self.set_mode_ui("am")
+        self._skip_auto = True
+        self.freq = clamp_to_band(self.band, b["hz"])
+        self.refresh()
+        self.queue_send()
+
+    # ----- callsign lookup + log -----
+    def fill_call(self, call, grid=""):
+        if call and not call.startswith("<"):
+            self.call_entry.set_text(call)
+            if grid:
+                self._grids[call] = grid
+            self.on_lookup()
+
+    def on_lookup(self, *_):
+        call = self.call_entry.get_text().strip().upper()
+        if not call:
+            return
+        _n, _h, _p, lat, lon = RECEIVERS[self.rx_index]
+        try:
+            from .lookup import lookup
+            r = lookup(call, lat, lon, self._grids.get(call, ""))
+        except Exception as e:
+            self.lookup_out.set_label(f"🔴 Lookup failed: {e}")
+            return
+        where = f"  ·  📍 {r['km']:,} km, beam {r['bearing']}°" if "km" in r else ""
+        grid = f"  ·  {r['grid']}" if r.get("grid") else ""
+        self.lookup_out.set_label(f"🔎 {r['call']}  ·  🌍 {r['country']} ({r['cont']}, CQ {r['cq']}){grid}{where}")
+
+    def on_log(self, *_):
+        call = self.call_entry.get_text().strip().upper()
+        if not call:
+            self.lookup_out.set_label("✍️ Type a callsign first.")
+            return
+        from .lookup import log_entry
+        log_entry(call, self.freq, self.band, self.mode, grid=self._grids.get(call, ""),
+                  note="FT8" if self.mode == "usb" and call in self.cqs else "")
+        self.lookup_out.set_label(f"✅ Logged {call} on {self.freq / 1e6:.4f} MHz {self.mode.upper()}")
+        self.show_log()
+
+    def show_log(self):
+        from .lookup import read_log
+        while (row := self.log_list.get_row_at_index(0)) is not None:
+            self.log_list.remove(row)
+        for d in read_log():
+            t = d.get("TIME_ON", "")[:4]
+            text = (f"{d.get('QSO_DATE', '')[6:8]}/{d.get('QSO_DATE', '')[4:6]} {t[:2]}:{t[2:]}Z  "
+                    f"{d['CALL']:<10} {d.get('FREQ', '')[:7]:<8} {d.get('MODE', ''):<4} {d.get('GRIDSQUARE', '')}")
+            row = Gtk.ListBoxRow()
+            row.set_child(Gtk.Label(label=text, xalign=0, css_classes=["spot-row"]))
+            self.log_list.append(row)
+
     def on_cq(self, _lb, row):
         c = row.cq
-        self.mode = "usb"
-        self.mode_buttons["USB"].set_active(True)
+        self.set_mode_ui("usb")
+        self._skip_auto = True
+        self.fill_call(c.get("call"), c.get("grid", ""))
         self.freq = clamp_to_band(self.band, c["rf"] - 1500)  # heard as a 1.5 kHz tone
         self.refresh()
         self.queue_send()
@@ -466,9 +682,9 @@ class Window(Adw.ApplicationWindow):
         else:
             hz = sp["hz"]
         self.freq = clamp_to_band(self.band, hz)
-        for n, b in self.mode_buttons.items():
-            if n.lower() == self.mode:
-                b.set_active(True)
+        self.set_mode_ui(self.mode)
+        self._skip_auto = True
+        self.fill_call(sp.get("call"), sp.get("grid", ""))
         self.refresh()
         self.queue_send()
 
@@ -545,6 +761,9 @@ class Window(Adw.ApplicationWindow):
 
     def send(self):
         self._pending = None
+        if self.auto and not self._skip_auto:
+            self.set_mode_ui(self.auto_mode(self.freq))
+        self._skip_auto = False
         if not self.rig:
             return False
         for attempt in (1, 2):  # one retry: a slow reply can knock the link out of step
@@ -634,10 +853,13 @@ class Window(Adw.ApplicationWindow):
             self.show_cond_note()
             self.show_spots()
             self.show_voice()
+            self.show_stations()
             self.refresh()
             self.queue_send()
 
     def on_mode(self, btn, name):
+        if btn.get_active() and not self._guard and self.auto and name.lower() != self.mode:
+            self.auto_btn.set_active(False)  # you chose a mode yourself
         if btn.get_active():
             self.mode = name.lower()
             self.refresh()
