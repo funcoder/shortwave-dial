@@ -191,6 +191,7 @@ class Window(Adw.ApplicationWindow):
         keys = Gtk.EventControllerKey()
         keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)  # beat button focus nav
         keys.connect("key-pressed", self.on_key)
+        keys.connect("key-released", self.on_key_up)
         self.add_controller(keys)
         self.connect("close-request", self.on_close)
         self.refresh()
@@ -314,7 +315,7 @@ class Window(Adw.ApplicationWindow):
 
     def check_lock(self):
         """Read the frequency back from the receiver link and compare."""
-        if not self.rig or self._pending:
+        if not self.rig or self._pending or getattr(self, "_held", False):
             return True
         try:
             rx_hz = self.rig.get_freq()
@@ -343,7 +344,7 @@ class Window(Adw.ApplicationWindow):
         if self._pending:
             GLib.source_remove(self._pending)
         self.set_lock("🟡 Tuning…", "pending")
-        self._pending = GLib.timeout_add(120, self.send)
+        self._pending = GLib.timeout_add(250, self.send)  # scroll: wait until wheel settles
 
     # ----- UI handlers -----
     def on_scroll(self, ctrl, _dx, dy):
@@ -364,8 +365,19 @@ class Window(Adw.ApplicationWindow):
             step = steps[keyval]
         self.freq = clamp_to_band(self.band, self.freq + step)
         self.refresh()
-        self.queue_send()
+        # Only move the dial while held; tune the receiver on key release.
+        if self._pending:
+            GLib.source_remove(self._pending)
+            self._pending = None
+        self._held = True
+        self.set_lock("🟡 Let go to tune…", "pending")
         return True
+
+    def on_key_up(self, _ctrl, keyval, _code, _state):
+        from gi.repository import Gdk
+        if keyval in (Gdk.KEY_Up, Gdk.KEY_Down, Gdk.KEY_Left, Gdk.KEY_Right):
+            self._held = False
+            self.queue_send()
 
     def on_band(self, btn, name):
         if btn.get_active() and name != self.band:
