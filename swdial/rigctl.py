@@ -46,7 +46,21 @@ class Rigctl:
         line, self._buf = self._buf.split(b"\n", 1)
         return line.decode("ascii").strip()
 
+    def _drain(self):
+        """Throw away late replies left over from a timed-out command, so the
+        next reply we read really belongs to the next command."""
+        self._buf = b""
+        self._sock.setblocking(False)
+        try:
+            while self._sock.recv(4096):
+                pass
+        except (BlockingIOError, InterruptedError):
+            pass
+        finally:
+            self._sock.settimeout(self.timeout)
+
     def _send(self, cmd: str):
+        self._drain()
         self._sock.sendall((cmd + "\n").encode("ascii"))
 
     def _set(self, cmd: str):
@@ -68,7 +82,10 @@ class Rigctl:
 
     def get_freq(self) -> int:
         self._send("f")
-        return int(self._readline())
+        reply = self._readline()
+        if not reply.isdigit():
+            raise RigctlError(f"'f' gave {reply!r}")
+        return int(reply)
 
     def get_mode(self) -> str:
         self._send("m")

@@ -547,12 +547,16 @@ class Window(Adw.ApplicationWindow):
         self._pending = None
         if not self.rig:
             return False
-        try:
-            self.rig.set_freq(self.freq)
-            self.rig.set_mode(self.mode)
-        except Exception as e:  # keep UI alive
-            print(f"SEND-ERR freq={self.freq!r} mode={self.mode!r}: {e!r}", flush=True)
-            self.set_status(f"● {e}", ok=False)
+        for attempt in (1, 2):  # one retry: a slow reply can knock the link out of step
+            try:
+                self.rig.set_freq(self.freq)
+                self.rig.set_mode(self.mode)
+                self.set_status("● Connected", ok=True)
+                break
+            except Exception as e:  # keep UI alive
+                print(f"SEND-ERR try {attempt} freq={self.freq!r} mode={self.mode!r}: {e!r}", flush=True)
+                if attempt == 2:
+                    self.set_status(f"● Couldn't tune: {e}", ok=False)
         self.check_lock()
         self.write_state(True)
         return False
