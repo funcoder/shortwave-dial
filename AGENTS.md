@@ -30,7 +30,7 @@ git clone --depth 1 https://github.com/jks-prv/kiwiclient vendor/kiwiclient
 ## Rules
 - Fair use on public receivers: one channel, short sessions, no scanning, disconnect when done.
   Only use receivers whose admin allows non-browser (ext API) connections.
-- Installs go in `.venv` only. No `sudo`. No pushing — this repo has no remote.
+- Installs go in `.venv` only. No `sudo`. Remote is `origin` (github.com:funcoder/shortwave-dial); push only when Jonathan asks.
 - Done means: tests pass + window runs + screenshot next to the design PNG + short audio clip.
 
 ## FT8 decoder (`swdial/ft8/`)
