@@ -52,3 +52,12 @@ def test_helpers():
 def test_rejects_bad_mode(rig):
     with Rigctl(port=rig.port) as r, pytest.raises(ValueError):
         r.set_mode("wfm")
+
+
+def test_narrow_filter_sends_kiwi_narrow_mode_but_reads_back_plain(rig):
+    with Rigctl(port=rig.port) as r:
+        r.set_mode("usb", narrow=True)
+        assert r.get_mode() == "USB"
+        r.set_mode("cw", narrow=True)
+        assert r.get_mode() == "CW"
+    assert "M usn" in rig.log and "M cwn" in rig.log

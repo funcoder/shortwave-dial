@@ -19,7 +19,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
-from .bands import BANDS, MODES, clamp_to_band, format_mhz  # noqa: E402
+from .bands import BANDS, MODES, NARROW, clamp_to_band, format_mhz  # noqa: E402
 from .rigctl import Rigctl  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -76,6 +76,8 @@ levelbar.smeter block.empty { background: #33312d; }
 .compact .hint { font-size: 13px; }
 .cw-text { font-family: monospace; font-size: 24px; font-weight: 800; color: #ffe08a; padding: 8px; }
 .compact .cw-text { font-size: 18px; }
+.ident-name { font-size: 28px; font-weight: 800; color: #ffb84d; }
+.compact .ident-name { font-size: 22px; }
 .cond-note { font-size: 15px; font-weight: 600; color: #d8d3c8; }
 .spot-row { font-family: monospace; font-size: 15px; font-weight: 700; padding: 4px 8px; }
 .spot-head { font-size: 15px; font-weight: 600; color: #b9b4aa; }
@@ -299,6 +301,11 @@ class Window(Adw.ApplicationWindow):
                                          tooltip_text="Pick CW / USB / LSB / AM for the part of the band you are in")
         self.auto_btn.connect("toggled", self.on_auto)
         mrow.append(self.auto_btn)
+        self.narrow_btn = Gtk.ToggleButton(label="🎚️ Narrow", css_classes=["autobtn"],
+                                           tooltip_text="Narrow filter: cuts out stations next door. "
+                                                        "Not used on FT8, which needs the full width.")
+        self.narrow_btn.connect("toggled", lambda b: self.queue_send())
+        mrow.append(self.narrow_btn)
         right.append(mrow)
         self.lock = Gtk.Label(label="⏳ Waiting for receiver…", xalign=0, css_classes=["lock", "pending"])
         right.append(self.lock)
@@ -397,6 +404,18 @@ class Window(Adw.ApplicationWindow):
         clr.connect("clicked", lambda *_: self.cw_text.set_label(""))
         cw_page.append(clr)
         stack.add_titled(cw_page, "cw", "🔤 Morse")
+        id_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=6)
+        self.id_btn = Gtk.Button(label="🔍 What is this signal?", halign=Gtk.Align.START, css_classes=["bigbtn"])
+        self.id_btn.connect("clicked", self.on_identify)
+        id_page.append(self.id_btn)
+        self.id_name = Gtk.Label(label="", xalign=0, wrap=True, css_classes=["ident-name"])
+        self.id_why = Gtk.Label(label="Press the button while you can hear the signal. It listens for 8 seconds.",
+                                xalign=0, wrap=True, css_classes=["lookup"])
+        id_page.append(self.id_name)
+        id_page.append(self.id_why)
+        id_page.append(Gtk.Label(label="A best guess from the shape of the sound, not a decoder.",
+                                 xalign=0, wrap=True, css_classes=["label-small"]))
+        stack.add_titled(id_page, "ident", "🔍 Identify")
         self.txt_rows = []
         stack.add_titled(spot_page, "spots", "📡 Heard")
         log_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=6)
@@ -487,6 +506,36 @@ class Window(Adw.ApplicationWindow):
         self._auto_tab_for = None
         self.live_cw = LiveCW(self._cw_pid, lambda t, w, f: GLib.idle_add(self.add_cw, t, w, f))
 
+    # ----- what is this signal? -----
+    def on_identify(self, *_):
+        pid = self.proc.pid if self.proc and self.proc.poll() is None else None
+        if not pid:
+            self.id_name.set_label("")
+            self.id_why.set_label("📴 Not connected to a receiver yet.")
+            return
+        on_ft8 = self.mode == "usb" and any(abs(self.freq - d) <= 1500 for d in self.FT8_DIALS)
+        where = f"{self.freq / 1e6:.4f} MHz {self.mode.upper()}"
+        self.id_btn.set_sensitive(False)
+        self.id_btn.set_label("👂 Listening for 8 seconds…")
+        self.id_name.set_label("")
+        self.id_why.set_label(f"Listening on {where}…")
+
+        def work():
+            from .ident import listen_and_identify
+            try:
+                r = listen_and_identify(pid, self.mode, on_ft8)
+            except Exception as e:
+                r = {"name": "Couldn't listen", "why": str(e), "sure": True}
+            GLib.idle_add(show, r)
+
+        def show(r):
+            self.id_btn.set_sensitive(True)
+            self.id_btn.set_label("🔍 What is this signal?")
+            self.id_name.set_label(("" if r["sure"] else "Probably: ") + r["name"])
+            self.id_why.set_label(f"{r['why']}\n📻 Heard on {where}")
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
     # ----- Morse -----
     def _cw_pid(self):
         if self.proc and self.proc.poll() is None and self.mode == "cw" and not self._pending \
@@ -510,6 +559,11 @@ class Window(Adw.ApplicationWindow):
     # ----- locked: FT8 = quiet + chime + FT8 text, CW = Morse tab -----
     FT8_DIALS = (1_840_000, 3_573_000, 5_357_000, 7_074_000, 10_136_000, 14_074_000, 18_100_000,
                  21_074_000, 24_915_000, 28_074_000)
+
+    def narrow(self):
+        """Narrow filter wanted, and not on an FT8 channel (FT8 needs 300-3000 Hz)."""
+        on_ft8 = self.mode == "usb" and any(abs(self.freq - d) <= 1500 for d in self.FT8_DIALS)
+        return bool(getattr(self, "narrow_btn", None) and self.narrow_btn.get_active()) and not on_ft8
 
     def on_locked(self):
         pid = self.proc.pid if self.proc and self.proc.poll() is None else None
@@ -827,7 +881,29 @@ class Window(Adw.ApplicationWindow):
             return
         where = f"  ·  📍 {r['km']:,} km, beam {r['bearing']}°" if "km" in r else ""
         grid = f"  ·  {r['grid']}" if r.get("grid") else ""
-        self.lookup_out.set_label(f"🔎 {r['call']}  ·  🌍 {r['country']} ({r['cont']}, CQ {r['cq']}){grid}{where}")
+        place = f"🔎 {r['call']}  ·  🌍 {r['country']} ({r['cont']}, CQ {r['cq']}){grid}{where}"
+        self.lookup_out.set_label(f"{place}\n👤 Looking up name…")
+        import threading
+        threading.Thread(target=self._find_name, args=(call, place), daemon=True).start()
+
+    def _find_name(self, call, place):
+        from .lookup import operator, ACCOUNTS
+        try:
+            op = operator(call)
+            if op:
+                town = f", {op['qth']}" if op.get("qth") else ""
+                line = f"👤 {op['name']}{town}  ({op['source']})"
+            elif ACCOUNTS.exists():
+                line = "👤 Name not found"
+            else:
+                line = "👤 Name: US calls only. Add a QRZ or HamQTH login for the rest of the world."
+        except Exception as e:
+            line = f"👤 Name lookup failed: {e}"
+
+        def show():
+            if self.call_entry.get_text().strip().upper() == call:  # still the same call
+                self.lookup_out.set_label(f"{place}\n{line}")
+        GLib.idle_add(show)
 
     def on_log(self, *_):
         call = self.call_entry.get_text().strip().upper()
@@ -840,6 +916,8 @@ class Window(Adw.ApplicationWindow):
                   note="FT8" if self.mode == "usb" and call in self.cqs else "")
         self.lookup_out.set_label(f"✅ Logged {call} on {self.freq / 1e6:.4f} MHz {self.mode.upper()}"
                                   + (f"  ·  report {rst}" if rst else ""))
+        self.call_entry.set_text("")  # ready for the next one
+        self.call_entry.grab_focus()
         self.show_log()
 
     def show_log(self):
@@ -970,7 +1048,7 @@ class Window(Adw.ApplicationWindow):
             self.quiet.off(None)  # new stream starts on the normal speakers
         name, host, port, _lat, _lon = RECEIVERS[self.rx_index]
         cmd = [sys.executable, str(KIWID), "-s", host, "-p", str(port),
-               "-f", f"{self.freq / 1000:.3f}", "-m", self.mode,
+               "-f", f"{self.freq / 1000:.3f}", "-m", NARROW[self.mode] if self.narrow() else self.mode,
                "-u", "ShortwaveDial-G7MJF", "--rigctl", "--rigctl-port", str(RIG_PORT)]
         self.proc = subprocess.Popen(cmd, cwd=KIWID.parent, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         import threading
@@ -1074,7 +1152,7 @@ class Window(Adw.ApplicationWindow):
         for attempt in (1, 2):  # one retry: a slow reply can knock the link out of step
             try:
                 self.rig.set_freq(self.freq)
-                self.rig.set_mode(self.mode)
+                self.rig.set_mode(self.mode, narrow=self.narrow())
                 self.set_status("● Connected", ok=True)
                 break
             except Exception as e:  # keep UI alive
@@ -1098,7 +1176,8 @@ class Window(Adw.ApplicationWindow):
         if abs(rx_hz - self.freq) <= 5 and rx_mode == self.mode:
             self.on_locked()
             quiet = "  ·  🔇 FT8, sound off" if self.quiet.active else ""
-            self.set_lock(f"✅ Receiver locked on {rx_hz / 1e6:.5f} MHz {rx_mode.upper()}{quiet}", None)
+            narrow = "  ·  🎚️ narrow" if self.narrow() else ""
+            self.set_lock(f"✅ Receiver locked on {rx_hz / 1e6:.5f} MHz {rx_mode.upper()}{narrow}{quiet}", None)
         else:
             self.set_lock(f"⚠️ Receiver is on {rx_hz / 1e6:.5f} MHz {rx_mode.upper()}", "off")
         return True

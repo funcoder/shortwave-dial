@@ -5,7 +5,7 @@ It answers set commands with 'RPRT 0' (ok) or 'RPRT -1' (error).
 """
 import socket
 
-from .bands import MODES
+from .bands import MODES, NARROW
 
 
 class RigctlError(RuntimeError):
@@ -74,11 +74,11 @@ class Rigctl:
             raise ValueError("KiwiSDR covers 0-32 MHz")
         self._set(f"F {int(hz)}")
 
-    def set_mode(self, mode: str):
+    def set_mode(self, mode: str, narrow: bool = False):
         mode = mode.lower()
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}")
-        self._set(f"M {mode}")
+        self._set(f"M {NARROW[mode] if narrow else mode}")
 
     def get_freq(self) -> int:
         self._send("f")
@@ -91,4 +91,5 @@ class Rigctl:
         self._send("m")
         mode = self._readline()
         self._readline()  # passband
-        return mode.upper()
+        wide = {n: w for w, n in NARROW.items()}
+        return wide.get(mode.lower(), mode.lower()).upper()

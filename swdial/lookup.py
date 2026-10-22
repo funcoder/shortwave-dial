@@ -100,6 +100,123 @@ def lookup(call: str, rx_lat: float, rx_lon: float, grid: str = "", cty=None) ->
     return out
 
 
+# ----- operator name (online) -----
+# QRZ.com or HamQTH when a login is saved in ACCOUNTS, else callook.info (US calls only, no login).
+ACCOUNTS = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "shortwave-dial" / "accounts.ini"
+QRZ_URL = "https://xmldata.qrz.com/xml/current/"
+HAMQTH_URL = "https://www.hamqth.com/xml.php"
+_US = re.compile(r"^(K|N|W|A[A-L])[A-Z]?[0-9][A-Z]{1,3}$")
+_names, _sessions = {}, {}
+
+
+def _get(url: str, params: dict, timeout: float) -> str:
+    import urllib.parse
+    import urllib.request
+    from .conditions import USER_AGENT
+    req = urllib.request.Request(url + "?" + urllib.parse.urlencode(params), headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def _xml(text: str) -> dict:
+    """Flatten XML to {tag: text}, namespaces dropped (last one wins)."""
+    import xml.etree.ElementTree as ET
+    return {e.tag.rpartition("}")[2].lower(): (e.text or "").strip() for e in ET.fromstring(text).iter()}
+
+
+def _tidy(name: str) -> str:
+    """'WELLS, JOSHUA D' -> 'Joshua D Wells'; leave mixed case alone."""
+    name = " ".join(name.split())
+    if "," in name:  # 'LAST, FIRST' or 'LAST, JR., FIRST'
+        parts = [p.strip() for p in name.split(",")]
+        name = " ".join([parts[-1], parts[0], *parts[1:-1]])
+    return name.title() if name.isupper() else name
+
+
+def parse_qrz(text: str) -> dict | None:
+    d = _xml(text)
+    name = _tidy(f"{d.get('fname', '')} {d.get('name', '')}")
+    if not name:
+        return None
+    town = d.get("addr2", "")
+    return {"name": name, "qth": town, "grid": d.get("grid", ""), "source": "QRZ.com"}
+
+
+def parse_hamqth(text: str) -> dict | None:
+    d = _xml(text)
+    name = _tidy(d.get("adr_name") or d.get("nick", ""))
+    if not name:
+        return None
+    return {"name": name, "qth": d.get("qth", ""), "grid": d.get("grid", ""), "source": "HamQTH"}
+
+
+def parse_callook(text: str) -> dict | None:
+    import json
+    d = json.loads(text)
+    if d.get("status") != "VALID" or not d.get("name"):
+        return None
+    town = d.get("address", {}).get("line2", "").split(",")[0]
+    return {"name": _tidy(d["name"]), "qth": town.title(), "grid": d.get("location", {}).get("gridsquare", ""),
+            "source": "callook.info"}
+
+
+def accounts(path_=None) -> dict:
+    """{'qrz': (user, password), 'hamqth': (...)} from accounts.ini, if present."""
+    import configparser
+    cp = configparser.ConfigParser()
+    cp.read(path_ or ACCOUNTS)
+    return {s: (cp[s].get("user", ""), cp[s].get("password", ""))
+            for s in ("qrz", "hamqth") if s in cp and cp[s].get("user") and cp[s].get("password")}
+
+
+def _session_lookup(svc, call, user, pw, timeout):
+    """Log in once per run (again if the session expired), then look up."""
+    for _ in range(2):
+        if svc not in _sessions:
+            if svc == "qrz":
+                d = _xml(_get(QRZ_URL, {"username": user, "password": pw, "agent": "ShortwaveDial"}, timeout))
+                key = d.get("key")
+            else:
+                d = _xml(_get(HAMQTH_URL, {"u": user, "p": pw}, timeout))
+                key = d.get("session_id")
+            if not key:
+                raise RuntimeError(f"{svc} login: {d.get('error', 'refused')}")
+            _sessions[svc] = key
+        if svc == "qrz":
+            text = _get(QRZ_URL, {"s": _sessions[svc], "callsign": call}, timeout)
+        else:
+            text = _get(HAMQTH_URL, {"id": _sessions[svc], "callsign": call, "prg": "ShortwaveDial"}, timeout)
+        err = _xml(text).get("error", "").lower()
+        if "session" in err or "expired" in err or ("invalid" in err and "key" in err):
+            _sessions.pop(svc, None)
+            continue
+        return (parse_qrz if svc == "qrz" else parse_hamqth)(text)
+    return None
+
+
+def operator(call: str, timeout: float = 8.0, accts=None) -> dict | None:
+    """Name and town of a callsign holder, or None. Blocks: call from a thread."""
+    call = call.upper().strip()
+    base = max(call.split("/"), key=len)
+    if base in _names:
+        return _names[base]
+    accts = accounts() if accts is None else accts
+    r, errors = None, []
+    for svc in ("qrz", "hamqth"):
+        if svc in accts:
+            try:
+                r = _session_lookup(svc, base, *accts[svc], timeout)
+                break
+            except Exception as e:
+                errors.append(str(e))
+    if r is None and _US.match(base):
+        r = parse_callook(_get(f"https://callook.info/{base}/json", {}, timeout))
+    if r is None and errors:
+        raise RuntimeError("; ".join(errors))
+    _names[base] = r
+    return r
+
+
 def _f(tag, val):
     val = str(val)
     return f"<{tag}:{len(val)}>{val} " if val else ""

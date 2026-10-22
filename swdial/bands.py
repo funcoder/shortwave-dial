@@ -8,6 +8,8 @@ BANDS = {
 }
 
 MODES = ("am", "lsb", "usb", "cw")
+# Kiwi's narrow filters: keep out stations next door. USB/LSB 300-2400 Hz, CW 60 Hz, AM +-2.5 kHz.
+NARROW = {"am": "amn", "lsb": "lsn", "usb": "usn", "cw": "cwn"}
 
 
 def clamp_to_band(band: str, hz: int) -> int:
