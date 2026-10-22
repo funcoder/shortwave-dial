@@ -3,3 +3,7 @@ __pycache__/
 .pytest_cache/
 vendor/
 proof/*.wav
+proof/*.bak*
+proof/*.log
+proof/*.png
+proof/kiwi_noname.txt
