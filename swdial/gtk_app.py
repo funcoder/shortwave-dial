@@ -9,6 +9,7 @@ import math
 import os
 import subprocess
 import sys
+import re
 import time
 from pathlib import Path
 
@@ -81,6 +82,10 @@ levelbar.smeter block.empty { background: #33312d; }
 .hint { font-size: 16px; font-weight: 600; color: #f2efe8;
         background: #262522; border-radius: 22px; padding: 6px 16px; }
 """
+
+
+class GtkWindowHelpers:
+    _GRID = re.compile(r"^[A-R]{2}[0-9]{2}$")
 
 
 class Dial(Gtk.DrawingArea):
@@ -372,6 +377,11 @@ class Window(Adw.ApplicationWindow):
         sw3.set_child(self.txt_list)
         txt_page.append(self.txt_head)
         txt_page.append(sw3)
+        self.blip_btn = Gtk.ToggleButton(label="🔔 Blip on new callsign", active=True,
+                                         halign=Gtk.Align.START, css_classes=["tabbtn"])
+        self.blip_btn.connect("toggled", lambda b: b.set_label(
+            "🔔 Blip on new callsign" if b.get_active() else "🔕 Blip off"))
+        txt_page.append(self.blip_btn)
         stack.add_titled(txt_page, "txt", "💬 FT8 text")
         cw_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=4)
         self.cw_head = Gtk.Label(label="🔤 Switch to CW mode to decode Morse.", xalign=0, wrap=True,
@@ -525,9 +535,69 @@ class Window(Adw.ApplicationWindow):
     def _on_ft8_slot(self, slot, res):  # called from a worker thread
         GLib.idle_add(self.apply_ft8, slot, res, getattr(self, "_slot_dial", self.freq))
 
+    # ----- automatic callsign lookup for FT8 -----
+    _GRID = re.compile(r"^[A-R]{2}[0-9]{2}$")
+
+    @staticmethod
+    def ft8_sender(msg):
+        """(callsign, grid) of whoever sent an FT8 message, or (None, '')."""
+        t = msg.upper().split()
+        if not t:
+            return None, ""
+        grid = t[-1] if GtkWindowHelpers._GRID.match(t[-1]) and t[-1] != "RR73" else ""
+        if t[0] == "CQ":
+            rest = [x for x in t[1:] if x != grid]
+            call = rest[-1] if rest else None
+        else:
+            call = t[1] if len(t) > 1 else None
+        if call and (call.startswith("<") or not re.search(r"[0-9]", call) or len(call) < 3):
+            call = call.strip("<>") if call.startswith("<") and call != "<...>" else None
+        return call, grid
+
+    def who(self, call, grid=""):
+        """Short 'country · km · beam' text. Never blocks the window."""
+        if not call:
+            return ""
+        from . import lookup as L
+        if L._cty is None:
+            if not getattr(self, "_cty_loading", False):
+                import threading
+                self._cty_loading = True
+                threading.Thread(target=lambda: L.load_cty(), daemon=True).start()
+            return ""
+        grid = grid or self._grids.get(call, "")
+        key = (call, grid)
+        cache = self.__dict__.setdefault("_who", {})
+        if key not in cache:
+            _n, _h, _p, lat, lon = RECEIVERS[self.rx_index]
+            try:
+                r = L.lookup(call, lat, lon, grid)
+            except Exception:
+                r = {"country": "Unknown"}
+            if r.get("country", "Unknown") == "Unknown":
+                cache[key] = ""
+            else:
+                far = f" {r['km']:,} km {r['bearing']}°" if "km" in r else ""
+                cache[key] = f"🌍 {r['country']}{far}"
+        return cache[key]
+
     def apply_ft8(self, slot, res, dial):
         now = time.time()
         res = [r for r in res if "error" not in r]
+        for r in res:
+            c, g = self.ft8_sender(r.get("msg", ""))
+            if c and g:
+                self._grids[c] = g
+            r["_who"] = self.who(c, g)
+            r["_call"] = c
+        seen = self.__dict__.setdefault("_seen_calls", {})
+        new = [r["_call"] for r in res if r["_call"] and now - seen.get(r["_call"], 0) > 600]
+        for r in res:
+            if r["_call"]:
+                seen[r["_call"]] = now
+        if new and getattr(self, "blip_btn", None) and self.blip_btn.get_active():
+            from .audio import blip
+            blip()
         ncq = 0
         for r in res:
             if r.get("is_cq") and r.get("call"):
@@ -539,7 +609,7 @@ class Window(Adw.ApplicationWindow):
                                        "msg": r["msg"], "t": now, "slot": slot}
         self.cqs = {k: v for k, v in self.cqs.items() if now - v["t"] < 180}
         hh = f"{slot[:2]}:{slot[2:4]}:{slot[4:]}"
-        print(f"FT8 {slot} decodes={len(res)} cq={ncq}", flush=True)
+        print(f"FT8 {slot} decodes={len(res)} cq={ncq} looked_up={sum(1 for r in res if r['_who'])} new={len(new)}", flush=True)
         self.cq_head.set_label(f"📣 {hh} UTC: {len(res)} decoded, {ncq} CQ"
                                f" · {len(self.cqs)} CQs in last 3 min (click to jump)")
         while (row := self.cq_list.get_row_at_index(0)) is not None:
@@ -547,20 +617,21 @@ class Window(Adw.ApplicationWindow):
         for c in sorted(self.cqs.values(), key=lambda c: -c["t"]):
             snr = f"{c['snr']:+.0f} dB" if c.get("snr") is not None else ""
             age = int(now - c["t"])
-            text = f"{c['rf'] / 1e6:.5f}  {snr:>6}  {age:>3}s ago   {c['msg']}"
+            info = self.who(c["call"], c.get("grid", ""))
+            text = f"{c['rf'] / 1e6:.5f}  {snr:>6}  {age:>3}s ago   {c['msg']}" + (f"   {info}" if info else "")
             row = Gtk.ListBoxRow()
             row.set_child(Gtk.Label(label=text, xalign=0, css_classes=["spot-row"]))
             row.cq = c
             self.cq_list.append(row)
         for k, r in enumerate(sorted(res, key=lambda r: r["freq_hz"])):
             snr = f"{r['snr']:+.0f}" if r.get("snr") is not None else ""
-            text = f"{hh}  {snr:>4} dB  {int(r['freq_hz']):>4} Hz   {r['msg']}"
+            text = f"{hh}  {snr:>4} dB  {int(r['freq_hz']):>4} Hz   {r['msg']}" + (f"   {r['_who']}" if r["_who"] else "")
             row = Gtk.ListBoxRow()
             lab = Gtk.Label(label=text, xalign=0, css_classes=["spot-row"])
             if r.get("is_cq"):
                 lab.add_css_class("cond-good")
             row.set_child(lab)
-            row.cq = {"rf": int(dial + r["freq_hz"])}
+            row.cq = {"rf": int(dial + r["freq_hz"]), "call": r.get("_call")}
             self.txt_list.insert(row, k)  # this slot's block goes on top
         self.txt_head.set_label(f"💬 {hh} UTC: {len(res)} messages (newest at top, green = CQ, click to jump)")
         # keep the list short: last ~80 lines

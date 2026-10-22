@@ -88,3 +88,25 @@ def chime():
         subprocess.Popen(["pw-play", str(_CHIME)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass
+
+
+_BLIP = Path(tempfile.gettempdir()) / "swdial-blip.wav"
+
+
+def blip():
+    """One short soft tick for a new callsign."""
+    if not _BLIP.exists():
+        sr, f, n = 24000, 1600, int(24000 * 0.06)
+        frames = bytearray()
+        for i in range(n):
+            env = min(1, i / 120) * min(1, (n - i) / 600)
+            frames += struct.pack("<h", int(6000 * env * math.sin(2 * math.pi * f * i / sr)))
+        with wave.open(str(_BLIP), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sr)
+            w.writeframes(bytes(frames))
+    try:
+        subprocess.Popen(["pw-play", str(_BLIP)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
