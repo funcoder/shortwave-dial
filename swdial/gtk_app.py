@@ -189,6 +189,34 @@ class Dial(Gtk.DrawingArea):
                 cr.arc(px, py, 6, 0, 2 * math.pi)
                 cr.fill()
                 self.hits.append((px, py, "cq", c))
+        # strongest stations near the receiver - gold stars with call signs
+        cr.select_font_face("sans-serif", 0, 1)
+        cr.set_font_size(13)
+        for rank, st in enumerate(self.win.strongest()):
+            f = (st["hz"] - band["start"]) / span
+            if not 0 <= f <= 1:
+                continue
+            a = start + sweep * f
+            px, py = cx + (r - 22) * math.cos(a), cy + (r - 22) * math.sin(a)
+            cr.set_source_rgb(1.0, 0.84, 0.25)
+            for k in range(10):  # 5-point star
+                rr = 9 if k % 2 == 0 else 4
+                ang = -math.pi / 2 + k * math.pi / 5
+                (cr.move_to if k == 0 else cr.line_to)(px + rr * math.cos(ang), py + rr * math.sin(ang))
+            cr.close_path()
+            cr.fill()
+            # call sign, staggered inward so neighbours don't overlap
+            lr = r - 64 - (rank % 2) * 16
+            label = f"{st['call']} {st['snr']:+.0f}"
+            ext = cr.text_extents(label)
+            cr.set_source_rgba(0.08, 0.08, 0.07, 0.75)
+            lx, ly = cx + lr * math.cos(a) - ext.width / 2, cy + lr * math.sin(a) + ext.height / 2
+            cr.rectangle(lx - 3, ly - ext.height - 3, ext.width + 6, ext.height + 6)
+            cr.fill()
+            cr.set_source_rgb(1.0, 0.84, 0.25)
+            cr.move_to(lx, ly)
+            cr.show_text(label)
+            self.hits.append((px, py, st["kind"], st["item"]))
         # inner knob
         cr.set_source_rgb(0.20, 0.195, 0.185)
         cr.arc(cx, cy, r * 0.42, 0, 2 * math.pi)
@@ -531,6 +559,27 @@ class Window(Adw.ApplicationWindow):
         self.refresh()
         self.queue_send()
 
+    # ----- strongest stations -----
+    def strongest(self, n=5):
+        """Top stations on this band by signal-to-noise: PSKReporter spots from
+        receivers near the Kiwi, plus FT8 we decoded ourselves (fresher wins)."""
+        best = {}
+        for sp in getattr(self, "spots", {}).get(self.band, []):
+            if sp.get("snr") is not None and sp.get("call"):
+                best[sp["call"]] = {"call": sp["call"], "hz": sp["hz"], "snr": sp["snr"], "kind": "spot", "item": sp}
+        for c in getattr(self, "cqs", {}).values():
+            if c.get("snr") is not None and BANDS[self.band]["start"] <= c["rf"] <= BANDS[self.band]["end"]:
+                best[c["call"]] = {"call": c["call"], "hz": c["rf"], "snr": c["snr"], "kind": "cq", "item": c}
+        # keep them apart on the ring (one small tick) so the labels stay readable
+        gap = (BANDS[self.band]["end"] - BANDS[self.band]["start"]) / 40
+        top = []
+        for x in sorted(best.values(), key=lambda x: -x["snr"]):
+            if all(abs(x["hz"] - t["hz"]) >= gap for t in top):
+                top.append(x)
+            if len(top) == n:
+                break
+        return sorted(top, key=lambda x: x["hz"])
+
     # ----- auto mode -----
     def auto_mode(self, hz):
         if self.band == "40m":
@@ -722,13 +771,17 @@ class Window(Adw.ApplicationWindow):
     def show_spots(self):
         while (row := self.spot_list.get_row_at_index(0)) is not None:
             self.spot_list.remove(row)
-        spots = self.spots.get(self.band, [])[:40]
-        self.spot_head.set_label(f"📡 Heard nearby on {self.band}: {len(self.spots.get(self.band, []))}"
-                                 "  (click to jump)" if spots else f"📡 Nothing heard nearby on {self.band}")
+        spots = sorted(self.spots.get(self.band, []),
+                       key=lambda sp: -(sp["snr"] if sp.get("snr") is not None else -99))[:40]
+        stars = {st["call"] for st in self.strongest()}
+        self.spot_head.set_label(f"📡 Heard near the receiver on {self.band}: {len(self.spots.get(self.band, []))},"
+                                 " strongest first. ⭐ = on the ring (click to jump)"
+                                 if spots else f"📡 Nothing heard nearby on {self.band}")
         for sp in spots:
             km = f"{sp['km']:,} km" if sp.get("km") is not None else ""
             snr = f"{sp['snr']:+.0f} dB" if sp.get("snr") is not None else ""
-            text = f"{sp['hz'] / 1e6:.5f}  {sp['call']:<10} {sp.get('grid',''):<4} {km:>9}  {sp['mode']:<5} {snr}"
+            star = "⭐" if sp["call"] in stars else "  "
+            text = f"{star} {sp['hz'] / 1e6:.5f}  {sp['call']:<10} {snr:>6}  {sp['mode']:<5} {km:>9}  {sp.get('grid','')}"
             row = Gtk.ListBoxRow()
             row.set_child(Gtk.Label(label=text, xalign=0, css_classes=["spot-row"]))
             row.spot = sp
