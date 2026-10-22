@@ -73,6 +73,8 @@ levelbar.smeter block.empty { background: #33312d; }
 .compact .autobtn { font-size: 14px; min-height: 36px; }
 .compact .tabbtn { font-size: 13px; min-height: 30px; }
 .compact .hint { font-size: 13px; }
+.cw-text { font-family: monospace; font-size: 24px; font-weight: 800; color: #ffe08a; padding: 8px; }
+.compact .cw-text { font-size: 18px; }
 .cond-note { font-size: 15px; font-weight: 600; color: #d8d3c8; }
 .spot-row { font-family: monospace; font-size: 15px; font-weight: 700; padding: 4px 8px; }
 .spot-head { font-size: 15px; font-weight: 600; color: #b9b4aa; }
@@ -371,6 +373,20 @@ class Window(Adw.ApplicationWindow):
         txt_page.append(self.txt_head)
         txt_page.append(sw3)
         stack.add_titled(txt_page, "txt", "💬 FT8 text")
+        cw_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=4)
+        self.cw_head = Gtk.Label(label="🔤 Switch to CW mode to decode Morse.", xalign=0, wrap=True,
+                                 css_classes=["spot-head"])
+        self.cw_text = Gtk.Label(label="", xalign=0, yalign=0, wrap=True, selectable=True,
+                                 css_classes=["cw-text"], vexpand=True)
+        sw7 = Gtk.ScrolledWindow(vexpand=True, min_content_height=150)
+        sw7.set_child(self.cw_text)
+        self.cw_scroll = sw7
+        cw_page.append(self.cw_head)
+        cw_page.append(sw7)
+        clr = Gtk.Button(label="🧹 Clear", halign=Gtk.Align.START, css_classes=["tabbtn"])
+        clr.connect("clicked", lambda *_: self.cw_text.set_label(""))
+        cw_page.append(clr)
+        stack.add_titled(cw_page, "cw", "🔤 Morse")
         self.txt_rows = []
         stack.add_titled(spot_page, "spots", "📡 Heard")
         log_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=6)
@@ -398,6 +414,7 @@ class Window(Adw.ApplicationWindow):
                            max_children_per_line=6, min_children_per_line=3,
                            column_spacing=6, row_spacing=6, margin_top=6)
         first = None
+        self.tab_btns = {}
         page = stack.get_pages()
         for i in range(page.get_n_items()):
             pg = page.get_item(i)
@@ -408,6 +425,7 @@ class Window(Adw.ApplicationWindow):
                 first = b
                 b.set_active(True)
             b.connect("toggled", lambda btn, name=pg.get_name(): btn.get_active() and stack.set_visible_child_name(name))
+            self.tab_btns[pg.get_name()] = b
             tabs.append(b)
         right.append(tabs)
         self._grids = {}
@@ -453,6 +471,49 @@ class Window(Adw.ApplicationWindow):
         self.show_log()
         from .live_ft8 import LiveFT8
         self.live = LiveFT8(self._live_pid, self._on_ft8_slot)
+        from .audio import Quiet
+        from .cw import LiveCW
+        self.quiet = Quiet()
+        self._auto_tab_for = None
+        self.live_cw = LiveCW(self._cw_pid, lambda t, w, f: GLib.idle_add(self.add_cw, t, w, f))
+
+    # ----- Morse -----
+    def _cw_pid(self):
+        if self.proc and self.proc.poll() is None and self.mode == "cw" and not self._pending \
+                and not getattr(self, "_held", False):
+            return self.proc.pid
+        return None
+
+    def add_cw(self, text, wpm, tone):
+        t = (self.cw_text.get_label() + text)[-1500:]
+        self.cw_text.set_label(t)
+        self.cw_head.set_label(f"🔤 Decoding Morse · {wpm} WPM · tone {tone:.0f} Hz")
+        adj = self.cw_scroll.get_vadjustment()
+        GLib.idle_add(lambda: adj.set_value(adj.get_upper()) or False)
+        return False
+
+    def select_tab(self, name):
+        b = getattr(self, "tab_btns", {}).get(name)
+        if b:
+            b.set_active(True)
+
+    # ----- locked: FT8 = quiet + chime + FT8 text, CW = Morse tab -----
+    FT8_DIALS = (1_840_000, 3_573_000, 5_357_000, 7_074_000, 10_136_000, 14_074_000, 18_100_000,
+                 21_074_000, 24_915_000, 28_074_000)
+
+    def on_locked(self):
+        pid = self.proc.pid if self.proc and self.proc.poll() is None else None
+        on_ft8 = self.mode == "usb" and any(abs(self.freq - d) <= 1500 for d in self.FT8_DIALS)
+        if on_ft8 and not self.quiet.active and pid:
+            if self.quiet.on(pid):
+                from .audio import chime
+                chime()
+                self.select_tab("txt")
+        elif not on_ft8 and self.quiet.active:
+            self.quiet.off(pid)
+        if self.mode == "cw" and self._auto_tab_for != "cw":
+            self.select_tab("cw")
+        self._auto_tab_for = self.mode
 
     # ----- live FT8 CQs -----
     def _live_pid(self):
@@ -834,6 +895,8 @@ class Window(Adw.ApplicationWindow):
     # ----- kiwi + rigctl -----
     def start_kiwi(self):
         self.stop_kiwi()
+        if getattr(self, "quiet", None) and self.quiet.active:
+            self.quiet.off(None)  # new stream starts on the normal speakers
         name, host, port, _lat, _lon = RECEIVERS[self.rx_index]
         cmd = [sys.executable, str(KIWID), "-s", host, "-p", str(port),
                "-f", f"{self.freq / 1000:.3f}", "-m", self.mode,
@@ -962,7 +1025,9 @@ class Window(Adw.ApplicationWindow):
             self.set_lock("⚠️ No answer from receiver", "off")
             return True
         if abs(rx_hz - self.freq) <= 5 and rx_mode == self.mode:
-            self.set_lock(f"✅ Receiver locked on {rx_hz / 1e6:.5f} MHz {rx_mode.upper()}", None)
+            self.on_locked()
+            quiet = "  ·  🔇 FT8, sound off" if self.quiet.active else ""
+            self.set_lock(f"✅ Receiver locked on {rx_hz / 1e6:.5f} MHz {rx_mode.upper()}{quiet}", None)
         else:
             self.set_lock(f"⚠️ Receiver is on {rx_hz / 1e6:.5f} MHz {rx_mode.upper()}", "off")
         return True
@@ -1061,6 +1126,10 @@ class Window(Adw.ApplicationWindow):
     def on_close(self, *_):
         if getattr(self, "live", None):
             self.live.stop()
+        if getattr(self, "live_cw", None):
+            self.live_cw.stop()
+        if getattr(self, "quiet", None):
+            self.quiet.off(self.proc.pid if self.proc else None)
         self.stop_kiwi()
         try:
             self.write_state(False)
