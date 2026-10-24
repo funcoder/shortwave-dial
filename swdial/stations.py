@@ -82,6 +82,7 @@ def _check(text: str):
 
 def stations_now(lo_hz: int, hi_hz: int) -> list:
     s = season()
+    # Plain HTTP: eibispace.de has no valid HTTPS certificate. _check rejects anything that isn't the schedule.
     body, _ = _cached_fetch(f"eibi-{s}.csv", f"http://www.eibispace.de/dx/sked-{s}.csv",
                             min_interval=86400, timeout=30, validate=_check)
     return parse(body, lo_hz, hi_hz) if body else []

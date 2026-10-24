@@ -9,7 +9,6 @@ import json
 import math
 import struct
 import subprocess
-import tempfile
 import wave
 from pathlib import Path
 
@@ -78,12 +77,16 @@ class Quiet:
             self.module = None
 
 
-_CHIME = Path(tempfile.gettempdir()) / "swdial-chime.wav"
+def _sound(name: str) -> Path:
+    """Our private per-user cache dir, not the shared /tmp."""
+    from .conditions import cache_dir
+    return Path(cache_dir()) / name
 
 
 def chime():
     """Two soft rising notes, played in the background."""
-    if not _CHIME.exists():
+    wav = _sound("chime.wav")
+    if not wav.exists():
         sr = 24000
         frames = bytearray()
         for f, dur in ((880, 0.12), (1320, 0.18)):
@@ -91,34 +94,32 @@ def chime():
             for i in range(n):
                 env = min(1, i / 240) * min(1, (n - i) / 1200)
                 frames += struct.pack("<h", int(9000 * env * math.sin(2 * math.pi * f * i / sr)))
-        with wave.open(str(_CHIME), "wb") as w:
+        with wave.open(str(wav), "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
             w.setframerate(sr)
             w.writeframes(bytes(frames))
     try:
-        subprocess.Popen(["pw-play", str(_CHIME)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(["pw-play", str(wav)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass
 
 
-_BLIP = Path(tempfile.gettempdir()) / "swdial-blip.wav"
-
-
 def blip():
     """One short soft tick for a new callsign."""
-    if not _BLIP.exists():
+    wav = _sound("blip.wav")
+    if not wav.exists():
         sr, f, n = 24000, 1600, int(24000 * 0.06)
         frames = bytearray()
         for i in range(n):
             env = min(1, i / 120) * min(1, (n - i) / 600)
             frames += struct.pack("<h", int(6000 * env * math.sin(2 * math.pi * f * i / sr)))
-        with wave.open(str(_BLIP), "wb") as w:
+        with wave.open(str(wav), "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
             w.setframerate(sr)
             w.writeframes(bytes(frames))
     try:
-        subprocess.Popen(["pw-play", str(_BLIP)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(["pw-play", str(wav)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass
