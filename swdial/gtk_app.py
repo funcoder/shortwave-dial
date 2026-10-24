@@ -102,6 +102,17 @@ levelbar.smeter block.empty { background: #33312d; }
 HINT = "🖱  Scroll or ↑↓ ←→ to tune  ·  ⇧ = fine 10 Hz"
 
 
+MAP_KEY = ('<span foreground="#ffb84d">●</span> Heard    <span foreground="#4dd9cc">●</span> In your log'
+           '    <span foreground="#f2efe8">◆</span> Receiver.  Hover a dot for details.')
+
+
+def _children(box):
+    c = box.get_first_child()
+    while c is not None:
+        yield c
+        c = c.get_next_sibling()
+
+
 def _row_label(text):
     """One list line. Too long for a narrow window: trim with … (full text on hover)."""
     return Gtk.Label(label=text, xalign=0, ellipsize=Pango.EllipsizeMode.END, tooltip_text=text,
@@ -272,6 +283,136 @@ class Dial(Gtk.DrawingArea):
         cr.fill()
 
 
+class WorldMap(Gtk.DrawingArea):
+    """Callsigns we have received, as dots on a world map. Hover for details, click to look up.
+    labels=True (the big map window) writes the calls next to the dots where there is room."""
+
+    def __init__(self, app_win, labels=False):
+        super().__init__(hexpand=True, vexpand=True, content_height=200, has_tooltip=True)
+        self.win, self.labels = app_win, labels
+        self.pts = []  # (x, y, point) as drawn last time, for hover and click
+        self.set_draw_func(self.draw)
+        click = Gtk.GestureClick()
+        click.connect("pressed", self.on_click)
+        self.add_controller(click)
+        self.connect("query-tooltip", self.on_tooltip)
+
+    def draw(self, _area, cr, w, h):
+        from .worldmap import fit, inside, land_rings, project
+        view = self.win.map_view
+        box = fit(w, h, view)
+        x0, y0, mw, mh, _v = box
+        cr.save()
+        cr.rectangle(x0, y0, mw, mh)
+        cr.clip()
+        cr.set_source_rgb(0.07, 0.09, 0.10)  # sea
+        cr.paint()
+        cr.set_source_rgba(1, 1, 1, 0.06)  # every 30 degrees (10 when zoomed in)
+        cr.set_line_width(1)
+        step = 30 if view == "world" else 10
+        for lon in range(-180 + step, 180, step):
+            x, _ = project(0, lon, box)
+            cr.move_to(x, y0)
+            cr.line_to(x, y0 + mh)
+        for lat in range(-60, 90, step):
+            _, y = project(lat, 0, box)
+            cr.move_to(x0, y)
+            cr.line_to(x0 + mw, y)
+        cr.stroke()
+        for ring in land_rings():
+            for i, (lon, lat) in enumerate(ring):
+                (cr.move_to if i == 0 else cr.line_to)(*project(lat, lon, box))
+            cr.close_path()
+        cr.set_source_rgb(0.21, 0.20, 0.18)
+        cr.fill_preserve()
+        cr.set_source_rgb(0.36, 0.34, 0.30)
+        cr.stroke()
+        cr.restore()
+
+        now, size = time.time(), 5 if self.labels else 4
+        self.pts = []
+        for p in reversed(self.win.map_points):  # oldest first, so the newest sit on top
+            if not inside(p["lat"], p["lon"], view):
+                continue
+            x, y = project(p["lat"], p["lon"], box)
+            self.pts.append((x, y, p))
+            fresh = now - p["e"]["last"] < 120  # heard in the last couple of FT8 slots
+            if fresh:
+                cr.set_source_rgba(*AMBER, 0.30)
+                cr.arc(x, y, size + 6, 0, 2 * math.pi)
+                cr.fill()
+            cr.set_source_rgb(*(TEAL if p["e"]["logged"] else AMBER))
+            cr.arc(x, y, size + (1 if fresh else 0), 0, 2 * math.pi)
+            cr.fill_preserve()
+            cr.set_source_rgb(0.07, 0.07, 0.06)
+            cr.set_line_width(1.2)
+            cr.stroke()
+        # the receiver we listen through
+        _n, _h, _p, rlat, rlon = RECEIVERS[self.win.rx_index]
+        rx, ry = project(rlat, rlon, box)
+        size_rx = 1 if inside(rlat, rlon, view) else 0
+        if size_rx:
+            cr.move_to(rx, ry - 9)
+            cr.line_to(rx + 7, ry)
+            cr.line_to(rx, ry + 9)
+            cr.line_to(rx - 7, ry)
+            cr.close_path()
+            cr.set_source_rgb(0.95, 0.93, 0.88)
+            cr.fill_preserve()
+            cr.set_source_rgb(0.07, 0.07, 0.06)
+            cr.set_line_width(2)
+            cr.stroke()
+
+        cr.select_font_face("sans-serif", 0, 1)
+        taken = []
+
+        def label(x, y, text, size, rgb, force=False):
+            cr.set_font_size(size)
+            ext = cr.text_extents(text)
+            lx, ly = min(x + size + 10, x0 + mw - ext.width - 4), y + ext.height / 2  # clear of the ring
+            rect = (lx - 3, ly - ext.height - 3, ext.width + 6, ext.height + 6)
+            if not force and any(rect[0] < t[0] + t[2] and t[0] < rect[0] + rect[2]
+                                 and rect[1] < t[1] + t[3] and t[1] < rect[1] + rect[3] for t in taken):
+                return
+            taken.append(rect)
+            cr.set_source_rgba(0.07, 0.07, 0.06, 0.85)
+            cr.rectangle(*rect)
+            cr.fill()
+            cr.set_source_rgb(*rgb)
+            cr.move_to(lx, ly)
+            cr.show_text(text)
+
+        sel = next((pt for pt in self.pts if pt[2]["call"] == self.win.map_sel), None)
+        if sel:
+            x, y, p = sel
+            cr.set_source_rgb(1, 1, 1)
+            cr.set_line_width(2.5)
+            cr.arc(x, y, size + 5, 0, 2 * math.pi)
+            cr.stroke()
+            label(x, y, p["call"], 17, (1, 1, 1), force=True)
+        if self.labels:
+            for x, y, p in reversed(self.pts):  # newest get the room first
+                if p is not (sel and sel[2]):
+                    label(x, y, p["call"], 14, TEAL if p["e"]["logged"] else AMBER)
+
+    def _hit(self, x, y):
+        from .worldmap import nearest
+        i = nearest(self.pts, x, y)
+        return None if i is None else self.pts[i][2]
+
+    def on_click(self, _g, _n, x, y):
+        p = self._hit(x, y)
+        if p:
+            self.win.map_select(p)
+
+    def on_tooltip(self, _w, x, y, _kb, tip):
+        p = self._hit(x, y)
+        if not p:
+            return False
+        tip.set_text(self.win.describe_heard(p))
+        return True
+
+
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Shortwave Dial")
@@ -294,6 +435,15 @@ class Window(Adw.ApplicationWindow):
         threading.Thread(target=self._rig_worker, daemon=True).start()
         self._pending = None
         self.stacked = False
+        from .heard import Heard
+        from .lookup import read_log
+        self.heard = Heard()  # every callsign received, for the map
+        try:
+            self.heard.merge_log(read_log(n=10 ** 6))
+        except Exception as e:
+            print(f"map: log back-fill: {e}", flush=True)
+        self.map_points, self.map_sel, self.map_since, self.map_view = [], None, 0, "world"
+        self.maps, self.map_infos, self.map_heads = [], [], []
 
         header = Adw.HeaderBar()
         title = Gtk.Label(label="Shortwave Dial", css_classes=["title"])
@@ -488,6 +638,7 @@ class Window(Adw.ApplicationWindow):
         sw6.set_child(self.log_list)
         log_page.append(sw6)
         stack.add_titled(log_page, "log", "📒 Log")
+        stack.add_titled(self._map_page(big=False), "map", "🗺️ Map")
         self.stack = stack
         tabs = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
                            max_children_per_line=6, min_children_per_line=3,
@@ -556,6 +707,8 @@ class Window(Adw.ApplicationWindow):
         self.refresh_stations()
         GLib.timeout_add_seconds(600, self.refresh_stations)  # EiBi, downloaded once a day
         self.show_log()
+        GLib.idle_add(self.refresh_map)
+        GLib.timeout_add_seconds(60, lambda: self.refresh_map() or True)  # "last hour" rolls on, halos fade
         from .live_ft8 import LiveFT8
         self.live = LiveFT8(self._live_pid, self._on_ft8_slot)
         from .audio import Quiet
@@ -707,6 +860,12 @@ class Window(Adw.ApplicationWindow):
                 self._grids[c] = g
             r["_who"] = self.who(c, g)
             r["_call"] = c
+        for r in res:
+            if r["_call"]:
+                self.heard.add(r["_call"], self._grids.get(r["_call"], ""), self.band, r.get("snr"), now)
+        if any(r["_call"] for r in res):
+            self.save_heard()
+            self.refresh_map()
         seen = self.__dict__.setdefault("_seen_calls", {})
         new = [r["_call"] for r in res if r["_call"] and now - seen.get(r["_call"], 0) > 600]
         for r in res:
@@ -923,6 +1082,165 @@ class Window(Adw.ApplicationWindow):
         self.refresh()
         self.queue_send()
 
+    # ----- world map of callsigns received -----
+    def _map_page(self, big):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=4)
+        head = Gtk.Label(label="🗺️ Callsigns you receive on FT8 show up here.", xalign=0, wrap=True,
+                         css_classes=["spot-head"])
+        m = WorldMap(self, labels=big)
+        info = Gtk.Label(xalign=0, wrap=True, css_classes=["lookup"])
+        info.set_markup(MAP_KEY)
+        page.append(head)
+        page.append(m)
+        page.append(info)
+        row = Gtk.Box(spacing=6)
+        first = None
+        for text, secs in (("Last hour", 3600), ("Today", 86400), ("All time", 0)):
+            b = Gtk.ToggleButton(label=text, css_classes=["tabbtn"], active=secs == self.map_since)
+            if first:
+                b.set_group(first)
+            else:
+                first = b
+            b.connect("toggled", self.on_map_period, secs)
+            row.append(b)
+        page.append(row)
+        row2 = Gtk.Box(spacing=6)
+        first = None
+        for text, view in (("🌍 World", "world"), ("🇪🇺 Europe", "europe")):
+            b = Gtk.ToggleButton(label=text, css_classes=["tabbtn"], active=view == self.map_view)
+            if first:
+                b.set_group(first)
+            else:
+                first = b
+            b.connect("toggled", self.on_map_view, view)
+            row2.append(b)
+        if not big:
+            b = Gtk.Button(label="⛶ Big map", css_classes=["tabbtn"], hexpand=True, halign=Gtk.Align.END)
+            b.connect("clicked", self.open_big_map)
+            row2.append(b)
+        page.append(row2)
+        self.maps.append(m)
+        self.map_infos.append(info)
+        self.map_heads.append(head)
+        return page
+
+    def open_big_map(self, *_):
+        win = getattr(self, "_big_map", None)
+        if win is None:
+            win = self._big_map = Gtk.Window(title="Shortwave Dial map", transient_for=self,
+                                             default_width=1400, default_height=820)
+            page = self._map_page(big=True)
+            page.set_margin_start(12)
+            page.set_margin_end(12)
+            page.set_margin_bottom(12)
+            win.set_child(page)
+            win.connect("close-request", self._close_big_map, page)
+            self.refresh_map()
+        win.present()
+
+    def _close_big_map(self, win, page):
+        i = next(i for i, m in enumerate(self.maps) if m.get_parent() is page)
+        del self.maps[i], self.map_infos[i], self.map_heads[i]
+        self._big_map = None
+        return False
+
+    def _sync_map_buttons(self, btn):
+        """Same choice on the small and the big map."""
+        for m in self.maps:
+            for row in _children(m.get_parent()):
+                if isinstance(row, Gtk.Box) and any(b is btn for b in _children(row)):
+                    continue
+                for b in _children(row) if isinstance(row, Gtk.Box) else ():
+                    if isinstance(b, Gtk.ToggleButton) and b.get_label() == btn.get_label():
+                        b.set_active(True)
+
+    def on_map_period(self, btn, secs):
+        if btn.get_active() and secs != self.map_since:
+            self.map_since = secs
+            self._sync_map_buttons(btn)
+            self.refresh_map()
+
+    def on_map_view(self, btn, view):
+        if btn.get_active() and view != self.map_view:
+            self.map_view = view
+            self._sync_map_buttons(btn)
+            for m in self.maps:
+                m.queue_draw()
+
+    def save_heard(self):
+        try:
+            self.heard.save()
+        except OSError as e:
+            print(f"map: save: {e}", flush=True)
+
+    def refresh_map(self):
+        from . import lookup as L
+        from .heard import place
+        if L._cty is None and not getattr(self, "_cty_loading", False):
+            import threading
+            self._cty_loading = True
+
+            def load():
+                try:
+                    L.load_cty()
+                finally:
+                    self._cty_loading = False
+                GLib.idle_add(self.refresh_map)  # countries known now: put the rest on the map
+            threading.Thread(target=load, daemon=True).start()
+        t0 = time.time() - self.map_since if self.map_since else 0
+        pts, countries, unplaced = [], set(), 0
+        for call, e in self.heard.since(t0):
+            pl = place(call, e)
+            if not pl:
+                unplaced += 1
+                continue
+            lat, lon, country, exact = pl
+            if not exact:  # middle of the country: spread them out a little so they don't stack
+                import zlib
+                hsh = zlib.crc32(call.encode())
+                lat += ((hsh & 0xFF) / 255 - 0.5) * 3
+                lon += ((hsh >> 8 & 0xFF) / 255 - 0.5) * 4
+            pts.append({"call": call, "e": e, "lat": lat, "lon": lon, "country": country, "exact": exact})
+            if country:
+                countries.add(country)
+        self.map_points = pts
+        when = {3600: "in the last hour", 86400: "today"}.get(self.map_since, "so far")
+        if pts:
+            text = (f"🗺️ {len(pts)} callsign{'s' if len(pts) != 1 else ''} from {len(countries)} "
+                    f"countr{'ies' if len(countries) != 1 else 'y'} {when} (click a dot)")
+        else:
+            text = f"🗺️ No callsigns received {when}. Tune to an FT8 channel in USB to fill the map."
+        if unplaced:
+            text += f" · {unplaced} still looking up"
+        for head in self.map_heads:
+            head.set_label(text)
+        for m in self.maps:
+            m.queue_draw()
+        return False
+
+    def describe_heard(self, p):
+        from .lookup import path
+        _n, _h, _p, rlat, rlon = RECEIVERS[self.rx_index]
+        e = p["e"]
+        km, brg = path(rlat, rlon, p["lat"], p["lon"])
+        far = f"{km:,} km, beam {brg}°" if p["exact"] else f"about {km:,} km (middle of the country)"
+        grid = f" · {e['grid']}" if e["grid"] else ""
+        bands = ", ".join(e["bands"]) or "?"
+        snr = f" · best {e['snr']:+d} dB" if e["snr"] is not None else ""
+        last = time.strftime("%d %b %H:%M UTC", time.gmtime(e["last"]))
+        times = f"Heard {e['n']} time{'s' if e['n'] != 1 else ''}" if e["n"] else "In your log"
+        logged = " · ✅ in your log" if e["logged"] and e["n"] else ""
+        return (f"📍 {p['call']} · {p['country'] or 'Unknown'}{grid}\n{far} · {bands}{snr}\n"
+                f"{times}, last {last}{logged}")
+
+    def map_select(self, p):
+        self.map_sel = p["call"]
+        for info in self.map_infos:
+            info.set_text(self.describe_heard(p))
+        for m in self.maps:
+            m.queue_draw()
+        self.fill_call(p["call"], p["e"]["grid"])  # ready to look up / log on the Log tab
+
     # ----- callsign lookup + log -----
     def fill_call(self, call, grid=""):
         if call and not call.startswith("<"):
@@ -979,6 +1297,9 @@ class Window(Adw.ApplicationWindow):
                   note="FT8" if self.mode == "usb" and call in self.cqs else "")
         self.lookup_out.set_label(f"✅ Logged {call} on {self.freq / 1e6:.4f} MHz {self.mode.upper()}"
                                   + (f"  ·  report {rst}" if rst else ""))
+        self.heard.mark_logged(call, self._grids.get(call, ""), self.band)
+        self.save_heard()
+        self.refresh_map()
         self.call_entry.set_text("")  # ready for the next one
         self.call_entry.grab_focus()
         self.show_log()
@@ -1362,6 +1683,8 @@ class Window(Adw.ApplicationWindow):
 
     def on_receiver(self, dd, _p):
         self.rx_index = dd.get_selected()
+        for m in getattr(self, "maps", []):
+            m.queue_draw()
         GLib.idle_add(self.start_kiwi)
         self.refresh_conditions()
 

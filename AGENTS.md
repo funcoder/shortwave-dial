@@ -17,6 +17,8 @@ GTK4 window / swdial CLI / Waybar ──TCP 6400 (hamlib rigctl: F <Hz>, M <mode
 - `vendor/kiwiclient` = jks-prv/kiwiclient, cloned, NOT committed, NOT copied (it has no licence).
   We only run it as a separate program.
 - `swdial/rigctl.py` — our tiny rigctl client. `swdial/cli.py` — CLI + Waybar JSON.
+- `swdial/heard.py` + `worldmap.py` — 🗺️ Map tab: every FT8 call received (`~/.local/share/shortwave-dial/heard.json`)
+  on a world/Europe map. Coastlines: `swdial/data/land.json`, Natural Earth 110 m (public domain).
 
 ## Commands
 ```
