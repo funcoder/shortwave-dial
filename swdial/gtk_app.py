@@ -19,6 +19,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk, Pango  # noqa: E402
 
+from . import last  # noqa: E402
 from .bands import BANDS, MODES, NARROW, clamp_to_band, format_mhz  # noqa: E402
 from .rigctl import Rigctl  # noqa: E402
 
@@ -96,6 +97,9 @@ levelbar.smeter block.empty { background: #33312d; }
 .hint { font-size: 16px; font-weight: 600; color: #f2efe8;
         background: #262522; border-radius: 22px; padding: 6px 16px; }
 """
+
+
+HINT = "🖱  Scroll or ↑↓ ←→ to tune  ·  ⇧ = fine 10 Hz"
 
 
 def _row_label(text):
@@ -274,6 +278,13 @@ class Window(Adw.ApplicationWindow):
         self.set_default_size(1024, 700)
         self.band, self.mode = "40m", "usb"
         self.freq = BANDS["40m"]["default"]
+        self.rx_index = 0
+        saved = last.load()  # come back to the channel we were on when closed
+        if saved:
+            self.band, self.mode, self.freq = saved["band"], saved["mode"], saved["freq"]
+            names = [r[0] for r in RECEIVERS]
+            if saved["receiver"] in names:
+                self.rx_index = names.index(saved["receiver"])
         self.proc = None
         self.rig = None
         self._rig_jobs = 0  # receiver-link jobs queued or running on the worker
@@ -282,7 +293,6 @@ class Window(Adw.ApplicationWindow):
         self._rigq = queue.Queue()
         threading.Thread(target=self._rig_worker, daemon=True).start()
         self._pending = None
-        self.rx_index = 0
         self.stacked = False
 
         header = Adw.HeaderBar()
@@ -292,6 +302,7 @@ class Window(Adw.ApplicationWindow):
         tv.add_top_bar(header)
         self.rx = Gtk.DropDown.new_from_strings([r[0] for r in RECEIVERS])
         self.rx.add_css_class("rxdrop")
+        self.rx.set_selected(self.rx_index)  # before connecting, so it doesn't start a 2nd link
         self.rx.connect("notify::selected", self.on_receiver)
         header.pack_start(self.rx)
 
@@ -308,7 +319,7 @@ class Window(Adw.ApplicationWindow):
         self.dial.add_controller(click)
         left.set_child(self.dial)
         # sits in the empty gap at the bottom of the dial's 270° arc
-        hint = Gtk.Label(label="🖱  Scroll or ↑↓ ←→ to tune  ·  ⇧ = fine 10 Hz", css_classes=["hint"],
+        hint = self.hint = Gtk.Label(label=HINT, css_classes=["hint"],
                          halign=Gtk.Align.CENTER, valign=Gtk.Align.END, wrap=True,
                          justify=Gtk.Justification.CENTER, can_target=False)
         left.add_overlay(hint)
@@ -340,6 +351,11 @@ class Window(Adw.ApplicationWindow):
                                                         "Not used on FT8, which needs the full width.")
         self.narrow_btn.connect("toggled", lambda b: self.queue_send())
         mrow.append(self.narrow_btn)
+        self.lock_btn = Gtk.ToggleButton(label="🔒 Lock dial", css_classes=["autobtn"],
+                                         tooltip_text="Stay on this channel. Arrow keys and scroll "
+                                                      "stop tuning, so arrows work in text boxes.")
+        self.lock_btn.connect("toggled", self.on_lock_dial)
+        mrow.append(self.lock_btn)
         right.append(mrow)
         self.lock = Gtk.Label(label="⏳ Waiting for receiver…", xalign=0, css_classes=["lock", "pending"])
         right.append(self.lock)
@@ -1287,7 +1303,13 @@ class Window(Adw.ApplicationWindow):
         self._pending = GLib.timeout_add(250, self.send)  # scroll: wait until wheel settles
 
     # ----- UI handlers -----
+    def on_lock_dial(self, btn):
+        self.hint.set_label("🔒 Dial locked  ·  click 🔒 Lock dial to tune again" if btn.get_active()
+                            else HINT)
+
     def on_scroll(self, ctrl, _dx, dy):
+        if self.lock_btn.get_active():
+            return True
         step = 10 if ctrl.get_current_event_state() & 1 else 100  # Shift = fine
         self.freq = clamp_to_band(self.band, int(self.freq - dy * step))
         self.refresh()
@@ -1297,8 +1319,8 @@ class Window(Adw.ApplicationWindow):
     def on_key(self, _ctrl, keyval, _code, state):
         from gi.repository import Gdk
         steps = {Gdk.KEY_Up: 100, Gdk.KEY_Down: -100, Gdk.KEY_Right: 1000, Gdk.KEY_Left: -1000}
-        if keyval not in steps:
-            return False
+        if keyval not in steps or self.lock_btn.get_active():
+            return False  # locked: let the arrows reach the focused text box
         if state & Gdk.ModifierType.SHIFT_MASK:  # fine tune: 10 Hz either way
             step = 10 if steps[keyval] > 0 else -10
         else:
@@ -1315,7 +1337,7 @@ class Window(Adw.ApplicationWindow):
 
     def on_key_up(self, _ctrl, keyval, _code, _state):
         from gi.repository import Gdk
-        if keyval in (Gdk.KEY_Up, Gdk.KEY_Down, Gdk.KEY_Left, Gdk.KEY_Right):
+        if keyval in (Gdk.KEY_Up, Gdk.KEY_Down, Gdk.KEY_Left, Gdk.KEY_Right) and getattr(self, "_held", False):
             self._held = False
             self.queue_send()
 
@@ -1356,6 +1378,10 @@ class Window(Adw.ApplicationWindow):
         self.dial.queue_draw()
 
     def write_state(self, on):
+        try:
+            last.save(self.freq, self.mode, self.band, RECEIVERS[self.rx_index][0])
+        except OSError as e:
+            print(f"save last channel: {e}", flush=True)
         STATE.write_text(json.dumps({"freq": self.freq, "mode": self.mode, "band": self.band,
                                      "receiver": RECEIVERS[self.rx_index][0], "conditions": {b: v.get("rating") for b, v in self.conds.items() if isinstance(v, dict)}, "on": on,
                                      "t": time.time()}))
