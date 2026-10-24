@@ -20,6 +20,18 @@ def _pactl(*a, timeout=3):
     return subprocess.run(["pactl", *a], capture_output=True, text=True, timeout=timeout)
 
 
+def default_sink():
+    """Name of the output the desktop is using now, or None.
+
+    kiwiclientd left to itself picks the *first* output, not the default; on
+    Try Omarchy that is the raw device under the Mac outputs, which can be silent."""
+    try:
+        name = _pactl("get-default-sink").stdout.strip()
+        return name if name and name != NULL else None
+    except Exception:
+        return None
+
+
 def sink_input(pid):
     """(index, sink id) of the playback stream owned by pid."""
     try:

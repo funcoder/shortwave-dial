@@ -17,7 +17,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, GLib, Gtk, Pango  # noqa: E402
 
 from .bands import BANDS, MODES, NARROW, clamp_to_band, format_mhz  # noqa: E402
 from .rigctl import Rigctl  # noqa: E402
@@ -27,10 +27,22 @@ KIWID = ROOT / "vendor" / "kiwiclient" / "kiwiclientd.py"
 STATE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "swdial.json"
 RIG_PORT = 6400
 
+# Only receivers whose /status shows ext_api > 0 (owner allows non-browser apps). Checked 2026-10-22.
 RECEIVERS = [  # name, host, port, lat, lon
     ("Wessex V2 · South West UK", "wessex.zapto.org", 8074, 50.74, -2.64),
     ("Wessex V1 · South West UK", "wessex.zapto.org", 8073, 50.74, -2.64),
+    ("Kernow · Cornwall", "kernow.hopto.org", 8073, 50.05, -5.18),
+    ("MSARS · Burgess Hill, Sussex", "msars.ddns.net", 8073, 50.96, -0.13),
+    ("GB0SNB · Kelvedon Hatch, Essex", "sdr.gb0snb.com", 8073, 51.67, 0.26),
+    ("Fordham · Cambridgeshire", "fordham.george-smart.co.uk", 8073, 52.31, 0.38),
+    ("GW0KIG · Merthyr Tydfil, Wales", "gw0kig.ddns.net", 8073, 51.73, -3.37),
+    ("G0DUB · Chester", "kiwisdr.g0dub.uk", 8073, 53.18, -2.82),
+    ("M9PSY · Dalgety Bay, Scotland", "44.31.241.13", 8073, 56.04, -3.36),
+    ("EI0CF · Malin Head, Ireland", "malinheadkiwi.hopto.org", 8073, 55.29, -7.26),
 ]
+
+MIN_DIAL = 220
+PANEL_W = 480  # control column width when the dial sits beside it
 
 AMBER = (1.0, 0.72, 0.30)
 TEAL = (0.30, 0.85, 0.80)
@@ -86,6 +98,12 @@ levelbar.smeter block.empty { background: #33312d; }
 """
 
 
+def _row_label(text):
+    """One list line. Too long for a narrow window: trim with … (full text on hover)."""
+    return Gtk.Label(label=text, xalign=0, ellipsize=Pango.EllipsizeMode.END, tooltip_text=text,
+                     css_classes=["spot-row"])
+
+
 class GtkWindowHelpers:
     _GRID = re.compile(r"^[A-R]{2}[0-9]{2}$")
 
@@ -94,11 +112,20 @@ class Dial(Gtk.DrawingArea):
     def __init__(self, app_win):
         super().__init__()
         self.win = app_win
-        self.set_content_width(220)   # smallest; grows with the window
-        self.set_content_height(220)
         self.set_hexpand(True)
         self.set_vexpand(True)
         self.set_draw_func(self.draw)
+
+    # Smallest 220 px; side by side it fills whatever the controls leave. Stacked
+    # (narrow or tall window) it asks to be square, up to 60% of the window height.
+    def do_get_request_mode(self):
+        return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH
+
+    def do_measure(self, orientation, for_size):
+        if orientation == Gtk.Orientation.VERTICAL and for_size > 0 and self.win.stacked:
+            nat = max(MIN_DIAL, min(for_size, int(self.win.get_height() * 0.6)))
+            return MIN_DIAL, nat, -1, -1
+        return MIN_DIAL, MIN_DIAL, -1, -1
 
     def draw(self, _area, cr, w, h):
         self.hits = []  # (x, y, kind, item) for click-to-jump
@@ -112,7 +139,7 @@ class Dial(Gtk.DrawingArea):
 
     def _draw(self, cr, w, h):
         band = BANDS[self.win.band]
-        cx, cy, r = w / 2, h / 2, min(w, h) / 2 - 16
+        cx, cy, r = w / 2, h / 2, min(w, h) / 2 - 6
         start, sweep = math.radians(135), math.radians(270)
         # face
         cr.set_source_rgb(0.15, 0.145, 0.135)
@@ -249,11 +276,18 @@ class Window(Adw.ApplicationWindow):
         self.freq = BANDS["40m"]["default"]
         self.proc = None
         self.rig = None
+        self._rig_jobs = 0  # receiver-link jobs queued or running on the worker
+        import queue
+        import threading
+        self._rigq = queue.Queue()
+        threading.Thread(target=self._rig_worker, daemon=True).start()
         self._pending = None
         self.rx_index = 0
+        self.stacked = False
 
         header = Adw.HeaderBar()
-        header.set_title_widget(Gtk.Label(label="Shortwave Dial", css_classes=["title"]))
+        title = Gtk.Label(label="Shortwave Dial", css_classes=["title"])
+        header.set_title_widget(title)
         tv = Adw.ToolbarView()
         tv.add_top_bar(header)
         self.rx = Gtk.DropDown.new_from_strings([r[0] for r in RECEIVERS])
@@ -261,9 +295,9 @@ class Window(Adw.ApplicationWindow):
         self.rx.connect("notify::selected", self.on_receiver)
         header.pack_start(self.rx)
 
-        body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=40,
-                       margin_top=24, margin_bottom=24, margin_start=32, margin_end=32)
-        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, hexpand=True, vexpand=True)
+        body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=24,
+                       margin_top=12, margin_bottom=12, margin_start=16, margin_end=16)
+        left = Gtk.Overlay(hexpand=True, vexpand=True)
         self.body, self.left = body, left
         self.dial = Dial(self)
         scroll = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
@@ -272,13 +306,15 @@ class Window(Adw.ApplicationWindow):
         click = Gtk.GestureClick()
         click.connect("pressed", self.on_dial_click)
         self.dial.add_controller(click)
-        left.append(self.dial)
+        left.set_child(self.dial)
+        # sits in the empty gap at the bottom of the dial's 270° arc
         hint = Gtk.Label(label="🖱  Scroll or ↑↓ ←→ to tune  ·  ⇧ = fine 10 Hz", css_classes=["hint"],
-                         halign=Gtk.Align.CENTER)
-        left.append(hint)
+                         halign=Gtk.Align.CENTER, valign=Gtk.Align.END, wrap=True,
+                         justify=Gtk.Justification.CENTER, can_target=False)
+        left.add_overlay(hint)
         body.append(left)
 
-        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, hexpand=True)
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         right.append(Gtk.Label(label="Frequency", xalign=0, css_classes=["label-small"]))
         row = Gtk.Box(spacing=12)
         self.readout = Gtk.Label(css_classes=["readout"])
@@ -293,10 +329,8 @@ class Window(Adw.ApplicationWindow):
         self._skip_auto = False
         self.band_buttons = {}
         self.mode_buttons = {}
-        mrow = Gtk.Box(spacing=10)
-        modes = self._toggle_row([m.upper() for m in MODES], "mode", self.on_mode)
-        modes.set_hexpand(True)
-        mrow.append(modes)
+        right.append(self._toggle_row([m.upper() for m in MODES], "mode", self.on_mode))
+        mrow = Gtk.Box(spacing=10, homogeneous=True)
         self.auto_btn = Gtk.ToggleButton(label="✨ Auto", active=True, css_classes=["autobtn"],
                                          tooltip_text="Pick CW / USB / LSB / AM for the part of the band you are in")
         self.auto_btn.connect("toggled", self.on_auto)
@@ -309,13 +343,13 @@ class Window(Adw.ApplicationWindow):
         right.append(mrow)
         self.lock = Gtk.Label(label="⏳ Waiting for receiver…", xalign=0, css_classes=["lock", "pending"])
         right.append(self.lock)
-        mrow2 = Gtk.Box(spacing=10)
-        self.meter = Gtk.LevelBar(min_value=0, max_value=15, hexpand=True, valign=Gtk.Align.CENTER,
+        mrow2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.meter = Gtk.LevelBar(min_value=0, max_value=15, hexpand=True,
                                   css_classes=["smeter"])
         for name, val in (("low", 5), ("high", 9), ("full", 15)):
             self.meter.add_offset_value(name, val)
         mrow2.append(self.meter)
-        self.meter_lbl = Gtk.Label(label="📶 S-meter starting…", xalign=0, css_classes=["meter-lbl"])
+        self.meter_lbl = Gtk.Label(label="📶 S-meter starting…", xalign=0, wrap=True, css_classes=["meter-lbl"])
         mrow2.append(self.meter_lbl)
         right.append(mrow2)
         GLib.timeout_add(500, self.update_meter)
@@ -330,7 +364,7 @@ class Window(Adw.ApplicationWindow):
         right.append(self.cond_note)
         self.conds = {}
         self.spots = {}
-        self.spot_head = Gtk.Label(label="📡 Heard nearby (click to jump)", xalign=0,
+        self.spot_head = Gtk.Label(label="📡 Heard nearby (click to jump)", xalign=0, wrap=True,
                                    css_classes=["spot-head"], margin_top=4)
         self.spot_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.spot_list.connect("row-activated", self.on_spot)
@@ -342,7 +376,7 @@ class Window(Adw.ApplicationWindow):
 
         # live CQs decoded here by our own FT8 decoder
         self.cqs = {}
-        self.cq_head = Gtk.Label(label="📣 Listening for CQs (USB mode, every 15 s)…", xalign=0,
+        self.cq_head = Gtk.Label(label="📣 Listening for CQs (USB mode, every 15 s)…", xalign=0, wrap=True,
                                  css_classes=["spot-head"], margin_top=4)
         self.cq_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.cq_list.connect("row-activated", self.on_cq)
@@ -459,7 +493,8 @@ class Window(Adw.ApplicationWindow):
         right.append(tabs)
         self._grids = {}
         right.append(stack)
-        rscroll = Gtk.ScrolledWindow(hexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        rscroll = Gtk.ScrolledWindow(hexpand=False, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                     width_request=PANEL_W)
         rscroll.set_child(right)
         if os.environ.get("SWDIAL_DEBUG"):
             def _dbg():
@@ -472,17 +507,24 @@ class Window(Adw.ApplicationWindow):
         tv.set_content(body)
         self.set_content(tv)
         self.set_size_request(380, 480)
-        # Tiled Hyprland windows can be narrow: stack dial above controls.
-        bp = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 820px"))
-        bp.add_setter(body, "margin-start", 12)
-        bp.add_setter(body, "margin-end", 12)
-        bp.add_setter(body, "margin-top", 12)
-        bp.connect("apply", lambda *_: self.add_css_class("compact"))
-        bp.connect("unapply", lambda *_: self.remove_css_class("compact"))
+        # Narrow or tall tiled windows: stack the dial above the controls. Side by side
+        # the dial gets (width - panel); stacked it gets the full width, so tall wins.
+        bp = Adw.Breakpoint.new(Adw.BreakpointCondition.parse(
+            f"max-width: {PANEL_W + MIN_DIAL + 160}px or max-aspect-ratio: 1/1"))
+        bp.add_setter(body, "margin-start", 10)
+        bp.add_setter(body, "margin-end", 10)
+        bp.add_setter(body, "margin-top", 6)
         bp.add_setter(body, "orientation", Gtk.Orientation.VERTICAL)
-        bp.add_setter(body, "spacing", 16)
+        bp.add_setter(body, "spacing", 10)
         bp.add_setter(left, "vexpand", False)
+        bp.add_setter(rscroll, "hexpand", True)
+        bp.add_setter(rscroll, "width-request", -1)
+        bp.add_setter(title, "visible", False)  # room for the receiver name
+        bp.connect("apply", lambda *_: self._set_stacked(True))
+        bp.connect("unapply", lambda *_: self._set_stacked(False))
         self.add_breakpoint(bp)
+        # the stacked dial's height depends on the window height: re-measure on resize
+        self.connect("notify::default-height", lambda *_: self.stacked and self.dial.queue_resize())
         keys = Gtk.EventControllerKey()
         keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)  # beat button focus nav
         keys.connect("key-pressed", self.on_key)
@@ -505,6 +547,11 @@ class Window(Adw.ApplicationWindow):
         self.quiet = Quiet()
         self._auto_tab_for = None
         self.live_cw = LiveCW(self._cw_pid, lambda t, w, f: GLib.idle_add(self.add_cw, t, w, f))
+
+    def _set_stacked(self, on):
+        self.stacked = on
+        (self.add_css_class if on else self.remove_css_class)("compact")
+        self.dial.queue_resize()
 
     # ----- what is this signal? -----
     def on_identify(self, *_):
@@ -674,14 +721,14 @@ class Window(Adw.ApplicationWindow):
             info = self.who(c["call"], c.get("grid", ""))
             text = f"{c['rf'] / 1e6:.5f}  {snr:>6}  {age:>3}s ago   {c['msg']}" + (f"   {info}" if info else "")
             row = Gtk.ListBoxRow()
-            row.set_child(Gtk.Label(label=text, xalign=0, css_classes=["spot-row"]))
+            row.set_child(_row_label(text))
             row.cq = c
             self.cq_list.append(row)
         for k, r in enumerate(sorted(res, key=lambda r: r["freq_hz"])):
             snr = f"{r['snr']:+.0f}" if r.get("snr") is not None else ""
             text = f"{hh}  {snr:>4} dB  {int(r['freq_hz']):>4} Hz   {r['msg']}" + (f"   {r['_who']}" if r["_who"] else "")
             row = Gtk.ListBoxRow()
-            lab = Gtk.Label(label=text, xalign=0, css_classes=["spot-row"])
+            lab = Gtk.Label(label=text, xalign=0, wrap=True, css_classes=["spot-row"])  # decoded text: never cut
             if r.get("is_cq"):
                 lab.add_css_class("cond-good")
             row.set_child(lab)
@@ -732,7 +779,7 @@ class Window(Adw.ApplicationWindow):
         for v in spots:
             text = f"{v['hz']/1e6:.4f}  {v['mode'].upper()}  {v['call']:<10} {v['age_min']:>2}m ago  {v['comment'][:28]}"
             row = Gtk.ListBoxRow()
-            row.set_child(Gtk.Label(label=text, xalign=0, css_classes=["spot-row"]))
+            row.set_child(_row_label(text))
             row.voice = v
             self.v_list.append(row)
 
@@ -847,7 +894,7 @@ class Window(Adw.ApplicationWindow):
         for b in self.bc:
             text = f"{b['hz'] / 1e3:>6.0f} kHz  {b['station'][:26]:<26} {b['lang'][:10]:<10} → {b['target']}"
             row = Gtk.ListBoxRow()
-            row.set_child(Gtk.Label(label=text, xalign=0, css_classes=["spot-row"]))
+            row.set_child(_row_label(text))
             row.station = b
             self.bc_list.append(row)
         self.dial.queue_draw()
@@ -929,7 +976,7 @@ class Window(Adw.ApplicationWindow):
             text = (f"{d.get('QSO_DATE', '')[6:8]}/{d.get('QSO_DATE', '')[4:6]} {t[:2]}:{t[2:]}Z  "
                     f"{d['CALL']:<10} {d.get('FREQ', '')[:7]:<8} {d.get('MODE', ''):<4} {d.get('RST_RCVD', ''):>4}  {d.get('GRIDSQUARE', '')}")
             row = Gtk.ListBoxRow()
-            row.set_child(Gtk.Label(label=text, xalign=0, css_classes=["spot-row"]))
+            row.set_child(_row_label(text))
             self.log_list.append(row)
 
     def on_cq(self, _lb, row):
@@ -993,7 +1040,7 @@ class Window(Adw.ApplicationWindow):
             star = "⭐" if sp["call"] in stars else "  "
             text = f"{star} {sp['hz'] / 1e6:.5f}  {sp['call']:<10} {snr:>6}  {sp['mode']:<5} {km:>9}  {sp.get('grid','')}"
             row = Gtk.ListBoxRow()
-            row.set_child(Gtk.Label(label=text, xalign=0, css_classes=["spot-row"]))
+            row.set_child(_row_label(text))
             row.spot = sp
             self.spot_list.append(row)
         self.dial.queue_draw()
@@ -1050,6 +1097,10 @@ class Window(Adw.ApplicationWindow):
         cmd = [sys.executable, str(KIWID), "-s", host, "-p", str(port),
                "-f", f"{self.freq / 1000:.3f}", "-m", NARROW[self.mode] if self.narrow() else self.mode,
                "-u", "ShortwaveDial-G7MJF", "--rigctl", "--rigctl-port", str(RIG_PORT)]
+        from .audio import default_sink
+        sink = default_sink()
+        if sink:
+            cmd += ["--snddev", sink]  # play where the desktop plays, not the first device found
         self.proc = subprocess.Popen(cmd, cwd=KIWID.parent, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         import threading
         threading.Thread(target=self._read_kiwi, args=(self.proc,), daemon=True).start()
@@ -1084,6 +1135,9 @@ class Window(Adw.ApplicationWindow):
                     elif line.strip():
                         log.write(line + b"\n")
                         log.flush()
+                        if b"Failed to connect" in line and proc is self.proc:
+                            # kiwiclientd keeps retrying; our rigctl link to it still works
+                            GLib.idle_add(self.set_status, "● Receiver not answering. Pick another one above.", False)
 
     @staticmethod
     def s_units(dbm):
@@ -1149,30 +1203,63 @@ class Window(Adw.ApplicationWindow):
         self._skip_auto = False
         if not self.rig:
             return False
-        for attempt in (1, 2):  # one retry: a slow reply can knock the link out of step
-            try:
-                self.rig.set_freq(self.freq)
-                self.rig.set_mode(self.mode, narrow=self.narrow())
+        freq, mode, narrow = self.freq, self.mode, self.narrow()
+
+        def work(rig):
+            for attempt in (1, 2):  # one retry: a slow reply can knock the link out of step
+                try:
+                    rig.set_freq(freq)
+                    rig.set_mode(mode, narrow=narrow)
+                    return None
+                except Exception as e:
+                    print(f"SEND-ERR try {attempt} freq={freq!r} mode={mode!r}: {e!r}", flush=True)
+                    if attempt == 2:
+                        return e
+
+        def done(err):
+            if err:
+                self.set_status(f"● Couldn't tune: {err}", ok=False)
+            else:
                 self.set_status("● Connected", ok=True)
-                break
-            except Exception as e:  # keep UI alive
-                print(f"SEND-ERR try {attempt} freq={self.freq!r} mode={self.mode!r}: {e!r}", flush=True)
-                if attempt == 2:
-                    self.set_status(f"● Couldn't tune: {e}", ok=False)
-        self.check_lock()
-        self.write_state(True)
+            self.check_lock()
+            self.write_state(True)
+        self._rig_do(work, done)
+        return False
+
+    # Receiver-link I/O runs on one worker thread, in order. Each command can wait
+    # 2 s for kiwiclientd; on the window thread a stalled link froze the window.
+    def _rig_worker(self):
+        while True:
+            rig, work, done = self._rigq.get()
+            try:
+                res = work(rig)
+            except Exception as e:
+                res = e
+            GLib.idle_add(self._rig_done, done, res)
+
+    def _rig_do(self, work, done):
+        self._rig_jobs += 1
+        self._rigq.put((self.rig, work, done))
+
+    def _rig_done(self, done, res):
+        self._rig_jobs -= 1
+        done(res)
         return False
 
     def check_lock(self):
         """Read the frequency back from the receiver link and compare."""
-        if not self.rig or self._pending or getattr(self, "_held", False):
-            return True
-        try:
-            rx_hz = self.rig.get_freq()
-            rx_mode = self.rig.get_mode().lower()
-        except Exception:
+        if not self.rig or self._pending or getattr(self, "_held", False) or self._rig_jobs:
+            return True  # a tune or check is still in flight: don't pile up behind it
+        self._rig_do(lambda rig: (rig.get_freq(), rig.get_mode().lower()), self._show_lock)
+        return True
+
+    def _show_lock(self, res):
+        if self._pending or getattr(self, "_held", False) or self._rig_jobs:
+            return  # tuning again, or a tune is queued behind this check: answer is out of date
+        if isinstance(res, Exception):
             self.set_lock("⚠️ No answer from receiver", "off")
-            return True
+            return
+        rx_hz, rx_mode = res
         if abs(rx_hz - self.freq) <= 5 and rx_mode == self.mode:
             self.on_locked()
             quiet = "  ·  🔇 FT8, sound off" if self.quiet.active else ""
@@ -1296,8 +1383,14 @@ def main():
     from gi.repository import Gdk
     Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov,
                                               Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    try:  # put us in the app launcher if we aren't there yet
+        from .desktop import ensure_launcher
+        ensure_launcher()
+    except Exception as e:
+        print(f"launcher entry: {e}", flush=True)
     app = Adw.Application(application_id="org.funcoder.ShortwaveDial")
-    app.connect("activate", lambda a: Window(a).present())
+    # launched again while open: bring the window forward, don't start a second receiver link
+    app.connect("activate", lambda a: (a.get_active_window() or Window(a)).present())
     app.run([])
 
 
