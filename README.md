@@ -103,4 +103,8 @@ non-browser connections.
 - Coastlines: [Natural Earth](https://www.naturalearthdata.com/) 110 m (public domain).
 - FT8 written from the public protocol description (QEX, 2020).
 
+## Licence
+
+MIT, see [LICENSE](LICENSE). This covers the code in this repo only, not kiwiclient.
+
 73 de G7MJF
